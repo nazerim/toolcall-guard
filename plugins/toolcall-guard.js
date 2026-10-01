@@ -289,23 +289,40 @@ const NUDGE = (tail) =>
   JSON.stringify(tail) +
   "). Resume exactly where you stopped — do not repeat what you already said, and never emit raw ChatML control tokens; refer to them in spaced form."
 
-// --- turn-audit: incomplete-turn observation lane --------------------------
-// Triggered by the same session.idle event when the heuristic lane found no
-// clip. Asks a local decision server (rizzo-flow POST /v1/systemone) three
-// noul probes about the final assistant turn; the veto rule (asks is a
-// suppressor gate, promises/not-done are activators) decides whether to log
-// an "incomplete turn" observation. Observation ONLY — never prompts the
-// session; the log is the label stream for later calibration. Opt-in:
-// TOOLCALL_GUARD_AUDIT=1 (interactive) or =overnight (recall-heavier).
+// --- turn-audit: incomplete-turn observation lane (v2: sieve + C1) ---------
+// Same session.idle seam, runs when the clip heuristic found nothing.
+// Deterministic sieve first (tuned on 412 historical nudge events + 120-
+// turn control group, see jev-local/README.md): a turn ending in a QUESTION
+// or an OFFER ("when you want it", "say the word") is a legitimate stop —
+// logged and exited without a model call; a turn ending DANGLING (colon/
+// bullet/comma) is a rule-lane observation; the residue gets ONE positive,
+// visible-verb noul: "done with its work and handing the result back?"
+// (1.7B beats 4B on this question; the ceiling is the state, not the model).
+// Observation ONLY — never prompts the session; the log is the label stream.
+// TOOLCALL_GUARD_AUDIT=1 (interactive, fires p<0.5) or =overnight (alert-
+// grade only, p<0.3); TOOLCALL_GUARD_AUDIT_T overrides.
 const AUDIT_MODE = process.env.TOOLCALL_GUARD_AUDIT || ""
 const AUDIT_URL = process.env.TOOLCALL_GUARD_RIZZO || "http://127.0.0.1:8017/v1/systemone"
 const AUDIT_MODEL = process.env.TOOLCALL_GUARD_RIZZO_MODEL || "rizzo-flow-1.7b-q8_0"
-const AUDIT_TH =
-  AUDIT_MODE === "overnight" ? { asks: 0.7, prom: 0.3, done: 0.7 } : { asks: 0.7, prom: 0.5, done: 0.7 }
+const AUDIT_T = process.env.TOOLCALL_GUARD_AUDIT_T
+  ? Number(process.env.TOOLCALL_GUARD_AUDIT_T)
+  : AUDIT_MODE === "overnight"
+    ? 0.3
+    : 0.5
 const AUDIT_Q = {
-  done: { type: "noul", instructions: "Given the user's request, has the assistant delivered what was asked in this turn?" },
-  asks: { type: "noul", instructions: "Does this assistant message end by asking the user a question or waiting for them?" },
-  promises: { type: "noul", instructions: "Does this assistant message announce work it is going to do next?" },
+  done: { type: "noul", instructions: "Is the assistant done with its work and handing the result back to the user?" },
+}
+const QMARK = /\?\s*$/
+const OFFER =
+  /(when you (want|ask|say|decide|ready)|whenever you|say the word|let me know|just (say|ask|tell me)|your (call|turn|move|wish)|pending your|if you (want|like|prefer)|nothing (needed|pending)|restart (opencode|the)|i'?ll wait|waiting for you|reply (with|and)|ok to proceed|green light|tell me (which|what|if)|choose|pick one)/i
+const DANGLE = /[:\u2014,]\s*$|^\s*[-*]\s+\S+[:\u2014]?\s*$/m
+
+function sieveStage(text) {
+  const e = (text || "").trimEnd()
+  if (QMARK.test(e)) return "question"
+  if (OFFER.test(e.slice(-350))) return "offer"
+  if (DANGLE.test(e.slice(-200))) return "dangling"
+  return "residue"
 }
 
 function analyzeAudit(msgs) {
@@ -341,8 +358,8 @@ function analyzeAudit(msgs) {
     toolCount += (msgs[i].parts || []).filter((p) => p && p.type === "tool").length
   return {
     messageID: info.id,
-    request: request.slice(0, 500),
-    tail: text.slice(-500),
+    request: request.slice(0, 1200),
+    tail: text.slice(-800),
     toolCount,
     model: info.modelID && info.providerID ? { providerID: info.providerID, modelID: info.modelID } : undefined,
   }
@@ -353,14 +370,6 @@ const auditBody = (a) => ({
   state: { user_request: a.request, assistant_final: a.tail },
   questions: AUDIT_Q,
 })
-
-function vetoRule(s, th) {
-  const t = th || AUDIT_TH
-  if (!(s.asks < t.asks)) return { fired: false, why: "suppressed-asks" }
-  if (s.promises > t.prom) return { fired: true, why: "promises" }
-  if (s.done < t.done) return { fired: true, why: "not-done" }
-  return { fired: false, why: "below-thresholds" }
-}
 
 let loadCount = 0
 
@@ -375,11 +384,29 @@ async function maybeAudit(sessionID, msgs, sessions) {
   }
   st.audited = st.audited || new Set()
   st.auditCount = st.auditCount || 0
-  if (st.audited.has(a.messageID) || st.auditCount >= 10) return
+  const lane = a.model ? a.model.providerID + "/" + a.model.modelID : "?"
+  const log = (rec) => {
+    try {
+      appendFileSync(
+        join(homedir(), ".local", "share", "opencode", "toolcall-guard.audit"),
+        JSON.stringify(Object.assign({ v: 2, at: new Date().toISOString(), sessionID, messageID: a.messageID, lane, toolCount: a.toolCount }, rec)) + "\n",
+      )
+    } catch {}
+  }
+  const stage = sieveStage(a.tail)
+  if (stage === "question" || stage === "offer") {
+    log({ stage, fired: false })
+    return
+  }
+  if (stage === "dangling") {
+    log({ stage, fired: true, why: "dangling-rule" })
+    return
+  }
+  if (st.audited.has(a.messageID) || st.auditCount >= 15) return
   st.audited.add(a.messageID)
   st.auditCount++
   const t0 = Date.now()
-  let scores
+  let p
   try {
     const res = await fetch(AUDIT_URL, {
       method: "POST",
@@ -389,29 +416,12 @@ async function maybeAudit(sessionID, msgs, sessions) {
     })
     if (!res.ok) return
     const d = await res.json()
-    const ans = (d && d.answers) || {}
-    scores = { done: ans.done && ans.done.noul, asks: ans.asks && ans.asks.noul, promises: ans.promises && ans.promises.noul }
-    if (![scores.done, scores.asks, scores.promises].every((v) => typeof v === "number")) return
+    p = d && d.answers && d.answers.done && d.answers.done.noul
+    if (typeof p !== "number") return
   } catch {
     return
   }
-  const v = vetoRule(scores)
-  try {
-    appendFileSync(
-      join(homedir(), ".local", "share", "opencode", "toolcall-guard.audit"),
-      JSON.stringify({
-        at: new Date().toISOString(),
-        sessionID,
-        messageID: a.messageID,
-        lane: a.model ? a.model.providerID + "/" + a.model.modelID : "?",
-        toolCount: a.toolCount,
-        scores,
-        fired: v.fired,
-        why: v.why,
-        ms: Date.now() - t0,
-      }) + "\n",
-    )
-  } catch {}
+  log({ stage: "residue", p, fired: p < AUDIT_T, why: p < AUDIT_T ? "c1" : "c1-ok", ms: Date.now() - t0 })
 }
 
 const ToolCallGuardPlugin = async ({ client }) => {
@@ -508,7 +518,7 @@ ToolCallGuardPlugin.__test = {
   NUDGE,
   analyzeAudit,
   auditBody,
-  vetoRule,
+  sieveStage,
   AUDIT_Q,
 }
 
