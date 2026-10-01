@@ -471,7 +471,7 @@ async function maybeAudit(sessionID, msgs, sessions) {
     try {
       appendFileSync(
         join(homedir(), ".local", "share", "opencode", "toolcall-guard.audit"),
-        JSON.stringify(Object.assign({ v: 2, at: new Date().toISOString(), sessionID, messageID: a.messageID, lane, toolCount: a.toolCount }, rec)) + "\n",
+        JSON.stringify(Object.assign({ v: 3, at: new Date().toISOString(), sessionID, messageID: a.messageID, lane, toolCount: a.toolCount }, rec)) + "\n",
       )
     } catch {}
   }
