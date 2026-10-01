@@ -516,6 +516,12 @@ const ToolCallGuardPlugin = async ({ client }) => {
         if (!event || event.type !== "session.idle") return
         const sessionID = event.properties && event.properties.sessionID
         if (!sessionID || !client) return
+        try {
+          appendFileSync(
+            join(homedir(), ".local", "share", "opencode", "toolcall-guard.idles"),
+            JSON.stringify({ at: new Date().toISOString(), sessionID }) + "\n",
+          )
+        } catch {}
         const sess = await client.session.get({ path: { id: sessionID } })
         const sdata = sess && sess.data
         if (sdata && sdata.parentID) return
@@ -548,7 +554,14 @@ const ToolCallGuardPlugin = async ({ client }) => {
             JSON.stringify({ at: new Date().toISOString(), sessionID, messageID: a.messageID, kind: a.kind }) + "\n",
           )
         } catch {}
-      } catch {}
+      } catch (e) {
+        try {
+          appendFileSync(
+            join(homedir(), ".local", "share", "opencode", "toolcall-guard.errors"),
+            JSON.stringify({ at: new Date().toISOString(), err: String((e && e.message) || e).slice(0, 300) }) + "\n",
+          )
+        } catch {}
+      }
     },
     "tool.execute.before": async (input, output) => {
       try {
