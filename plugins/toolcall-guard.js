@@ -281,6 +281,13 @@ function analyzeMessages(msgs) {
   if (!last) return null
   const { info, parts } = last
   if (info.error) return null
+  // Aborts (user esc) leave NO step-finish and mark MessageAbortedError only
+  // AFTER session.idle fires — the error check above races them. step-finish
+  // is written inline with the stream, so its absence is a race-free abort
+  // signal: provider clips end the turn "properly" (they LOOK complete —
+  // that is the whole failure mode); aborted streams die mid-part. Never
+  // nudge a stop the user chose.
+  if (!parts.some((p) => p && p.type === "step-finish")) return null
   if (["title", "summary", "compaction"].includes(info.agent)) return null
   if (parts.some((p) => p && p.type === "tool")) return null
   const text = parts
@@ -361,6 +368,7 @@ function analyzeAudit(msgs) {
   if (lastIdx < 0) return null
   const { info, parts = [] } = msgs[lastIdx]
   if (info.error) return null
+  if (!parts.some((p) => p && p.type === "step-finish")) return null
   if (["title", "summary", "compaction"].includes(info.agent)) return null
   if (parts.some((p) => p && p.type === "tool")) return null
   const text = parts

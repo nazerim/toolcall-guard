@@ -6,7 +6,10 @@ const { analyzeAudit, auditBody, sieveStage, AUDIT_Q } = plugin.__test
 const user = (text) => ({ info: { role: "user", id: "u1" }, parts: [{ type: "text", text }] })
 const asst = (id, opts = {}) => ({
   info: { role: "assistant", id, providerID: "p", modelID: "m", ...(opts.info || {}) },
-  parts: opts.parts || [{ type: "text", text: opts.text || "Here is the summary of the analysis." }],
+  parts: [
+    ...(opts.parts || [{ type: "text", text: opts.text || "Here is the summary of the analysis." }]),
+    ...(opts.noFinish ? [] : [{ type: "step-finish" }]),
+  ],
 })
 
 // --- sieveStage: deterministic exits ---------------------------------------
