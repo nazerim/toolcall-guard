@@ -29,6 +29,20 @@ import { join } from "node:path"
 
 const cleanName = (v) => (typeof v === "string" ? v.replace(/^[\s`]+|[\s`]+$/g, "") : "")
 
+// Local ISO stamp WITH offset (operator lives in UTC+8; bare toISOString()
+// is UTC and has caused repeated misreads of soak timestamps).
+const nowStamp = () => {
+  const d = new Date()
+  const off = -d.getTimezoneOffset()
+  const p = (n) => String(n).padStart(2, "0")
+  const sign = off >= 0 ? "+" : "-"
+  return (
+    `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T` +
+    `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}` +
+    `${sign}${p(Math.floor(Math.abs(off) / 60))}:${p(Math.abs(off) % 60)}`
+  )
+}
+
 const strId = (v) => {
   if (typeof v === "string") return v === "" ? undefined : v
   if (typeof v === "number") return String(v)
@@ -422,7 +436,7 @@ async function maybePreflight(input, output) {
     try {
       appendFileSync(
         join(homedir(), ".local", "share", "opencode", "toolcall-guard.preflight"),
-        JSON.stringify({ at: new Date().toISOString(), kind: "pattern", name: hit, mode: PREFLIGHT_MODE, cmd: cmd.slice(0, 200) }) + "\n",
+        JSON.stringify({ at: nowStamp(), kind: "pattern", name: hit, mode: PREFLIGHT_MODE, cmd: cmd.slice(0, 200) }) + "\n",
       )
     } catch {}
     if (PREFLIGHT_MODE === "block")
@@ -436,7 +450,7 @@ async function maybePreflight(input, output) {
     try {
       appendFileSync(
         join(homedir(), ".local", "share", "opencode", "toolcall-guard.preflight"),
-        JSON.stringify({ at: new Date().toISOString(), kind: "clamp", ms: CLAMP_MS, cmd: cmd.slice(0, 200) }) + "\n",
+        JSON.stringify({ at: nowStamp(), kind: "clamp", ms: CLAMP_MS, cmd: cmd.slice(0, 200) }) + "\n",
       )
     } catch {}
   }
@@ -449,7 +463,7 @@ function preflightAfter(input, output) {
     try {
       appendFileSync(
         join(homedir(), ".local", "share", "opencode", "toolcall-guard.preflight"),
-        JSON.stringify({ at: new Date().toISOString(), kind: "giant-output", bytes: out.length, cmd: ((input.args && input.args.command) || "").slice(0, 200) }) + "\n",
+        JSON.stringify({ at: nowStamp(), kind: "giant-output", bytes: out.length, cmd: ((input.args && input.args.command) || "").slice(0, 200) }) + "\n",
       )
     } catch {}
   }
@@ -471,7 +485,7 @@ async function maybeAudit(sessionID, msgs, sessions) {
     try {
       appendFileSync(
         join(homedir(), ".local", "share", "opencode", "toolcall-guard.audit"),
-        JSON.stringify(Object.assign({ v: 3, at: new Date().toISOString(), sessionID, messageID: a.messageID, lane, toolCount: a.toolCount }, rec)) + "\n",
+        JSON.stringify(Object.assign({ v: 3, at: nowStamp(), sessionID, messageID: a.messageID, lane, toolCount: a.toolCount }, rec)) + "\n",
       )
     } catch {}
   }
@@ -519,7 +533,7 @@ const ToolCallGuardPlugin = async ({ client }) => {
         try {
           appendFileSync(
             join(homedir(), ".local", "share", "opencode", "toolcall-guard.idles"),
-            JSON.stringify({ at: new Date().toISOString(), sessionID }) + "\n",
+            JSON.stringify({ at: nowStamp(), sessionID }) + "\n",
           )
         } catch {}
         const sess = await client.session.get({ path: { id: sessionID } })
@@ -551,14 +565,14 @@ const ToolCallGuardPlugin = async ({ client }) => {
         try {
           appendFileSync(
             join(homedir(), ".local", "share", "opencode", "toolcall-guard.clips"),
-            JSON.stringify({ at: new Date().toISOString(), sessionID, messageID: a.messageID, kind: a.kind }) + "\n",
+            JSON.stringify({ at: nowStamp(), sessionID, messageID: a.messageID, kind: a.kind }) + "\n",
           )
         } catch {}
       } catch (e) {
         try {
           appendFileSync(
             join(homedir(), ".local", "share", "opencode", "toolcall-guard.errors"),
-            JSON.stringify({ at: new Date().toISOString(), err: String((e && e.message) || e).slice(0, 300) }) + "\n",
+            JSON.stringify({ at: nowStamp(), err: String((e && e.message) || e).slice(0, 300) }) + "\n",
           )
         } catch {}
       }
@@ -583,7 +597,7 @@ const ToolCallGuardPlugin = async ({ client }) => {
           try {
             appendFileSync(
               join(homedir(), ".local", "share", "opencode", "toolcall-guard.scrubbed"),
-              JSON.stringify({ at: new Date().toISOString(), rewrites: stats.n }) + "\n",
+              JSON.stringify({ at: nowStamp(), rewrites: stats.n }) + "\n",
             )
           } catch {}
         }
@@ -605,7 +619,7 @@ const ToolCallGuardPlugin = async ({ client }) => {
         try {
           writeFileSync(
             join(homedir(), ".local", "share", "opencode", "toolcall-guard.loaded"),
-            JSON.stringify({ at: new Date().toISOString(), configHookRuns: loadCount, providersWrapped: wrapped }) + "\n",
+            JSON.stringify({ at: nowStamp(), configHookRuns: loadCount, providersWrapped: wrapped }) + "\n",
           )
         } catch {}
       } catch {}
