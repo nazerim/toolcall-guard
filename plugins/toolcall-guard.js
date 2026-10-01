@@ -503,6 +503,7 @@ async function maybeAudit(sessionID, msgs, sessions) {
   st.auditCount++
   const t0 = Date.now()
   let p
+  let probs
   try {
     const res = await fetch(AUDIT_URL, {
       method: "POST",
@@ -512,7 +513,7 @@ async function maybeAudit(sessionID, msgs, sessions) {
     })
     if (!res.ok) return
     const d = await res.json()
-    const probs = d && d.answers && d.answers.q && d.answers.q.probabilities
+    probs = d && d.answers && d.answers.q && d.answers.q.probabilities
     p = probs && probs.assistant
     if (typeof p !== "number") return
   } catch {
