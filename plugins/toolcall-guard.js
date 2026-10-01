@@ -289,7 +289,130 @@ const NUDGE = (tail) =>
   JSON.stringify(tail) +
   "). Resume exactly where you stopped — do not repeat what you already said, and never emit raw ChatML control tokens; refer to them in spaced form."
 
+// --- turn-audit: incomplete-turn observation lane --------------------------
+// Triggered by the same session.idle event when the heuristic lane found no
+// clip. Asks a local decision server (rizzo-flow POST /v1/systemone) three
+// noul probes about the final assistant turn; the veto rule (asks is a
+// suppressor gate, promises/not-done are activators) decides whether to log
+// an "incomplete turn" observation. Observation ONLY — never prompts the
+// session; the log is the label stream for later calibration. Opt-in:
+// TOOLCALL_GUARD_AUDIT=1 (interactive) or =overnight (recall-heavier).
+const AUDIT_MODE = process.env.TOOLCALL_GUARD_AUDIT || ""
+const AUDIT_URL = process.env.TOOLCALL_GUARD_RIZZO || "http://127.0.0.1:8017/v1/systemone"
+const AUDIT_MODEL = process.env.TOOLCALL_GUARD_RIZZO_MODEL || "rizzo-flow-1.7b-q8_0"
+const AUDIT_TH =
+  AUDIT_MODE === "overnight" ? { asks: 0.7, prom: 0.3, done: 0.7 } : { asks: 0.7, prom: 0.5, done: 0.7 }
+const AUDIT_Q = {
+  done: { type: "noul", instructions: "Given the user's request, has the assistant delivered what was asked in this turn?" },
+  asks: { type: "noul", instructions: "Does this assistant message end by asking the user a question or waiting for them?" },
+  promises: { type: "noul", instructions: "Does this assistant message announce work it is going to do next?" },
+}
+
+function analyzeAudit(msgs) {
+  let lastIdx = -1
+  for (let i = (msgs || []).length - 1; i >= 0; i--) {
+    if (msgs[i] && msgs[i].info && msgs[i].info.role === "assistant") {
+      lastIdx = i
+      break
+    }
+  }
+  if (lastIdx < 0) return null
+  const { info, parts = [] } = msgs[lastIdx]
+  if (info.error) return null
+  if (["title", "summary", "compaction"].includes(info.agent)) return null
+  if (parts.some((p) => p && p.type === "tool")) return null
+  const text = parts
+    .filter((p) => p && p.type === "text")
+    .map((p) => p.text || "")
+    .join("")
+  if (!text.trim() || clipKind(text)) return null
+  let request = ""
+  for (let i = lastIdx - 1; i >= 0; i--) {
+    if (msgs[i] && msgs[i].info && msgs[i].info.role === "user") {
+      request = (msgs[i].parts || [])
+        .filter((p) => p && p.type === "text")
+        .map((p) => p.text || "")
+        .join("")
+      break
+    }
+  }
+  let toolCount = 0
+  for (let i = lastIdx - 1; i >= 0 && msgs[i] && msgs[i].info && msgs[i].info.role === "assistant"; i--)
+    toolCount += (msgs[i].parts || []).filter((p) => p && p.type === "tool").length
+  return {
+    messageID: info.id,
+    request: request.slice(0, 500),
+    tail: text.slice(-500),
+    toolCount,
+    model: info.modelID && info.providerID ? { providerID: info.providerID, modelID: info.modelID } : undefined,
+  }
+}
+
+const auditBody = (a) => ({
+  model: AUDIT_MODEL,
+  state: { user_request: a.request, assistant_final: a.tail },
+  questions: AUDIT_Q,
+})
+
+function vetoRule(s, th) {
+  const t = th || AUDIT_TH
+  if (!(s.asks < t.asks)) return { fired: false, why: "suppressed-asks" }
+  if (s.promises > t.prom) return { fired: true, why: "promises" }
+  if (s.done < t.done) return { fired: true, why: "not-done" }
+  return { fired: false, why: "below-thresholds" }
+}
+
 let loadCount = 0
+
+async function maybeAudit(sessionID, msgs, sessions) {
+  if (!AUDIT_MODE) return
+  const a = analyzeAudit(msgs)
+  if (!a) return
+  let st = sessions.get(sessionID)
+  if (!st) {
+    st = { nudged: new Set(), count: 0 }
+    sessions.set(sessionID, st)
+  }
+  st.audited = st.audited || new Set()
+  st.auditCount = st.auditCount || 0
+  if (st.audited.has(a.messageID) || st.auditCount >= 10) return
+  st.audited.add(a.messageID)
+  st.auditCount++
+  const t0 = Date.now()
+  let scores
+  try {
+    const res = await fetch(AUDIT_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(auditBody(a)),
+      signal: AbortSignal.timeout(4000),
+    })
+    if (!res.ok) return
+    const d = await res.json()
+    const ans = (d && d.answers) || {}
+    scores = { done: ans.done && ans.done.noul, asks: ans.asks && ans.asks.noul, promises: ans.promises && ans.promises.noul }
+    if (![scores.done, scores.asks, scores.promises].every((v) => typeof v === "number")) return
+  } catch {
+    return
+  }
+  const v = vetoRule(scores)
+  try {
+    appendFileSync(
+      join(homedir(), ".local", "share", "opencode", "toolcall-guard.audit"),
+      JSON.stringify({
+        at: new Date().toISOString(),
+        sessionID,
+        messageID: a.messageID,
+        lane: a.model ? a.model.providerID + "/" + a.model.modelID : "?",
+        toolCount: a.toolCount,
+        scores,
+        fired: v.fired,
+        why: v.why,
+        ms: Date.now() - t0,
+      }) + "\n",
+    )
+  } catch {}
+}
 
 const ToolCallGuardPlugin = async ({ client }) => {
   const sessions = new Map()
@@ -305,7 +428,10 @@ const ToolCallGuardPlugin = async ({ client }) => {
         const res = await client.session.messages({ path: { id: sessionID }, query: { limit: 10 } })
         const msgs = (res && res.data) || res
         const a = analyzeMessages(msgs)
-        if (!a) return
+        if (!a) {
+          await maybeAudit(sessionID, msgs, sessions)
+          return
+        }
         let st = sessions.get(sessionID)
         if (!st) {
           st = { nudged: new Set(), count: 0 }
@@ -380,6 +506,10 @@ ToolCallGuardPlugin.__test = {
   clipKind,
   analyzeMessages,
   NUDGE,
+  analyzeAudit,
+  auditBody,
+  vetoRule,
+  AUDIT_Q,
 }
 
 export default ToolCallGuardPlugin
