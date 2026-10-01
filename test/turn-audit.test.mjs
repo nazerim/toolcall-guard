@@ -59,8 +59,9 @@ assert.equal(
   assert.match(q.instructions, /whose move is next/)
   assert.deepEqual(Object.keys(q.criteria), ["assistant", "user", "nobody"])
   assert.match(q.criteria.assistant, /Now I will/)
+  assert.match(q.criteria.assistant, /lists work that remains undone/)
   assert.match(q.criteria.user, /shall I/)
   assert.deepEqual(Object.keys(q).sort(), ["criteria", "instructions", "type"])
 }
 
-console.log("turn-audit v3: all assertions passed")
+console.log("turn-audit v4: all assertions passed")

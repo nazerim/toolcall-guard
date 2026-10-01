@@ -294,7 +294,9 @@ const NUDGE = (tail) =>
 // Deterministic sieve first (question/offer endings exit free — 55/55 of the
 // historical ask class and most handoffs; dangling ends are rule observations);
 // the residue gets ONE choice question, "whose move is next?", with visible
-// cue phrases in the option descriptions (W2b_balanced: best pain/consent
+// cue phrases in the option descriptions (W2d_pending: W2b + 'lists work that remains undone' — covers the
+// status-report stall subtype caught live; curves tie on opencode, better
+// recall at cut on pi; original W2b_balanced: best pain/consent
 // trade at matched FP on 200+200 offline sets; AUC 0.748, zero position bias,
 // 1.7B beats 4B). Fire = P(assistant) above threshold. Observation ONLY —
 // never prompts the session; the log is the label stream for calibration.
@@ -314,7 +316,7 @@ const AUDIT_Q = {
     instructions: "After this message, whose move is next?",
     criteria: {
       assistant:
-        "The assistant's: the message says it will do something next ('Now I will…', 'Let me…', 'Next I…') or the request clearly still needs an action, and that action has not happened in the message.",
+        "The assistant's: the message says it will do something next ('Now I will…', 'Let me…', 'Next I…'), lists work that remains undone, or the request clearly still needs an action — and that action has not happened in the message.",
       user:
         "The user's: the message asks them a question ('Do you want…?', 'Which…?'), offers them options, requests permission or go-ahead ('shall I?', 'ready when you are'), or needs an action on their side.",
       nobody: "Nobody's: the message delivered a complete answer, result, or summary; both sides are free.",
