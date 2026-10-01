@@ -289,28 +289,37 @@ const NUDGE = (tail) =>
   JSON.stringify(tail) +
   "). Resume exactly where you stopped — do not repeat what you already said, and never emit raw ChatML control tokens; refer to them in spaced form."
 
-// --- turn-audit: incomplete-turn observation lane (v2: sieve + C1) ---------
+// --- turn-audit: incomplete-turn observation lane (v3: sieve + whose-move) --
 // Same session.idle seam, runs when the clip heuristic found nothing.
-// Deterministic sieve first (tuned on 412 historical nudge events + 120-
-// turn control group, see jev-local/README.md): a turn ending in a QUESTION
-// or an OFFER ("when you want it", "say the word") is a legitimate stop —
-// logged and exited without a model call; a turn ending DANGLING (colon/
-// bullet/comma) is a rule-lane observation; the residue gets ONE positive,
-// visible-verb noul: "done with its work and handing the result back?"
-// (1.7B beats 4B on this question; the ceiling is the state, not the model).
-// Observation ONLY — never prompts the session; the log is the label stream.
-// TOOLCALL_GUARD_AUDIT=1 (interactive, fires p<0.5) or =overnight (alert-
-// grade only, p<0.3); TOOLCALL_GUARD_AUDIT_T overrides.
+// Deterministic sieve first (question/offer endings exit free — 55/55 of the
+// historical ask class and most handoffs; dangling ends are rule observations);
+// the residue gets ONE choice question, "whose move is next?", with visible
+// cue phrases in the option descriptions (W2b_balanced: best pain/consent
+// trade at matched FP on 200+200 offline sets; AUC 0.748, zero position bias,
+// 1.7B beats 4B). Fire = P(assistant) above threshold. Observation ONLY —
+// never prompts the session; the log is the label stream for calibration.
+// TOOLCALL_GUARD_AUDIT=1 (interactive, T=0.5) or =overnight (T=0.6);
+// TOOLCALL_GUARD_AUDIT_T overrides.
 const AUDIT_MODE = process.env.TOOLCALL_GUARD_AUDIT || ""
 const AUDIT_URL = process.env.TOOLCALL_GUARD_RIZZO || "http://127.0.0.1:8017/v1/systemone"
 const AUDIT_MODEL = process.env.TOOLCALL_GUARD_RIZZO_MODEL || "rizzo-flow-1.7b-q8_0"
 const AUDIT_T = process.env.TOOLCALL_GUARD_AUDIT_T
   ? Number(process.env.TOOLCALL_GUARD_AUDIT_T)
   : AUDIT_MODE === "overnight"
-    ? 0.3
+    ? 0.6
     : 0.5
 const AUDIT_Q = {
-  done: { type: "noul", instructions: "Is the assistant done with its work and handing the result back to the user?" },
+  q: {
+    type: "choice",
+    instructions: "After this message, whose move is next?",
+    criteria: {
+      assistant:
+        "The assistant's: the message says it will do something next ('Now I will…', 'Let me…', 'Next I…') or the request clearly still needs an action, and that action has not happened in the message.",
+      user:
+        "The user's: the message asks them a question ('Do you want…?', 'Which…?'), offers them options, requests permission or go-ahead ('shall I?', 'ready when you are'), or needs an action on their side.",
+      nobody: "Nobody's: the message delivered a complete answer, result, or summary; both sides are free.",
+    },
+  },
 }
 const QMARK = /\?\s*$/
 const OFFER =
@@ -416,12 +425,14 @@ async function maybeAudit(sessionID, msgs, sessions) {
     })
     if (!res.ok) return
     const d = await res.json()
-    p = d && d.answers && d.answers.done && d.answers.done.noul
+    const probs = d && d.answers && d.answers.q && d.answers.q.probabilities
+    p = probs && probs.assistant
     if (typeof p !== "number") return
   } catch {
     return
   }
-  log({ stage: "residue", p, fired: p < AUDIT_T, why: p < AUDIT_T ? "c1" : "c1-ok", ms: Date.now() - t0 })
+  const fired = p > AUDIT_T
+  log({ stage: "residue", p, probs, fired, why: fired ? "assistant-move" : "ok", ms: Date.now() - t0 })
 }
 
 const ToolCallGuardPlugin = async ({ client }) => {

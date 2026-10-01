@@ -49,17 +49,18 @@ assert.equal(
   assert.equal(a.model.providerID, "p")
 }
 
-// --- auditBody: single positive C1 noul, live wire shape -------------------
+// --- auditBody: single whose-move choice (W2b), live wire shape ------------
 {
   const body = auditBody({ request: "R", tail: "T" })
   assert.equal(body.model, "rizzo-flow-1.7b-q8_0")
   assert.deepEqual(body.state, { user_request: "R", assistant_final: "T" })
-  assert.deepEqual(Object.keys(body.questions), ["done"])
-  const q = body.questions.done
-  assert.equal(q.type, "noul")
-  assert.match(q.instructions, /handing the result back/)
-  assert.deepEqual(Object.keys(q).sort(), ["instructions", "type"])
-  assert.equal(Object.keys(AUDIT_Q).join(","), "done")
+  const q = body.questions.q
+  assert.equal(q.type, "choice")
+  assert.match(q.instructions, /whose move is next/)
+  assert.deepEqual(Object.keys(q.criteria), ["assistant", "user", "nobody"])
+  assert.match(q.criteria.assistant, /Now I will/)
+  assert.match(q.criteria.user, /shall I/)
+  assert.deepEqual(Object.keys(q).sort(), ["criteria", "instructions", "type"])
 }
 
-console.log("turn-audit v2: all assertions passed")
+console.log("turn-audit v3: all assertions passed")
