@@ -384,6 +384,77 @@ const auditBody = (a) => ({
 
 let loadCount = 0
 
+// --- pre-flight: deterministic blast-radius gate (②) ------------------------
+// Offline result (jev-local §preflight): the decision model never flags
+// wide_scan from command text alone (median P 0.01-0.05) — blast radius
+// lives in the filesystem, not the string. So ② is deterministic:
+//  (a) zero-ambiguity unbounded patterns (recursive ops on /, ~, $HOME)
+//      -> logged always; blocked only with TOOLCALL_GUARD_PREFLIGHT=block;
+//  (b) timeout clamp for scan-like commands with no explicit timeout
+//      (the "malformed exit-condition waits forever" class) — opt-in via
+//      TOOLCALL_GUARD_CLAMP=1, caps at 120s;
+//  (c) tool.execute.after records giant outputs (>50 KB) so the runaway-
+//      output denominator is measured in the wild, feeding later policy.
+const PREFLIGHT_MODE = process.env.TOOLCALL_GUARD_PREFLIGHT || ""
+const CLAMP_ON = process.env.TOOLCALL_GUARD_CLAMP === "1"
+const CLAMP_MS = 120000
+const DANGER = [
+  [/\bgrep\b[^\n]*\s-[a-zA-Z]*r[a-zA-Z]*\b/, /(?:^|\s)(?:\/|~\/?|\$HOME\/?)(?=\s|$)/, "recursive-grep-root"],
+  [/\bfind\s+(?:\/|~\/?|\$HOME\/?)(?=\s|$)/, null, "find-root"],
+  [/\brm\s+-[a-zA-Z]*r[a-zA-Z]*f?\s+(?:\/|~\/?|\$HOME\/?)(?=\s|$)/, null, "rm-rf-unbounded"],
+  [/\bls\s+-[a-zA-Z]*R[a-zA-Z]*\s+(?:\/|~\/?|\$HOME\/?)(?=\s|$)/, null, "ls-R-root"],
+  [/\bdu\b[^\n]*\s(?:\/|~\/?|\$HOME\/?)\s*$/, null, "du-root"],
+]
+const SCANLIKE = /\b(grep\b[^\n]*\s-[a-zA-Z]*r|rg\b|find\b|ls\s+-[a-zA-Z]*R|du\b|tree\b)/
+
+function preflightPattern(cmd) {
+  const c = cmd || ""
+  for (const [a, b, name] of DANGER) if (a.test(c) && (!b || b.test(c))) return name
+  return null
+}
+
+async function maybePreflight(input, output) {
+  if (!PREFLIGHT_MODE) return
+  if (input.tool !== "bash") return
+  const cmd = (output.args && output.args.command) || ""
+  const hit = preflightPattern(cmd)
+  if (hit) {
+    try {
+      appendFileSync(
+        join(homedir(), ".local", "share", "opencode", "toolcall-guard.preflight"),
+        JSON.stringify({ at: new Date().toISOString(), kind: "pattern", name: hit, mode: PREFLIGHT_MODE, cmd: cmd.slice(0, 200) }) + "\n",
+      )
+    } catch {}
+    if (PREFLIGHT_MODE === "block")
+      throw new Error(
+        `[toolcall-guard pre-flight] blocked ${hit}: recursive/filesystem-wide operation on an unbounded root. Narrow the path (project dir, --include, -maxdepth) and reissue.`,
+      )
+    return
+  }
+  if (CLAMP_ON && SCANLIKE.test(cmd) && !output.args.timeout) {
+    output.args.timeout = CLAMP_MS
+    try {
+      appendFileSync(
+        join(homedir(), ".local", "share", "opencode", "toolcall-guard.preflight"),
+        JSON.stringify({ at: new Date().toISOString(), kind: "clamp", ms: CLAMP_MS, cmd: cmd.slice(0, 200) }) + "\n",
+      )
+    } catch {}
+  }
+}
+
+function preflightAfter(input, output) {
+  if (!PREFLIGHT_MODE || input.tool !== "bash") return
+  const out = (output && output.output) || ""
+  if (out.length > 50000) {
+    try {
+      appendFileSync(
+        join(homedir(), ".local", "share", "opencode", "toolcall-guard.preflight"),
+        JSON.stringify({ at: new Date().toISOString(), kind: "giant-output", bytes: out.length, cmd: ((input.args && input.args.command) || "").slice(0, 200) }) + "\n",
+      )
+    } catch {}
+  }
+}
+
 async function maybeAudit(sessionID, msgs, sessions) {
   if (!AUDIT_MODE) return
   const a = analyzeAudit(msgs)
@@ -479,6 +550,18 @@ const ToolCallGuardPlugin = async ({ client }) => {
         } catch {}
       } catch {}
     },
+    "tool.execute.before": async (input, output) => {
+      try {
+        await maybePreflight(input, output)
+      } catch (e) {
+        if (String(e && e.message).startsWith("[toolcall-guard pre-flight]")) throw e
+      }
+    },
+    "tool.execute.after": async (input, output) => {
+      try {
+        preflightAfter(input, output)
+      } catch {}
+    },
     "experimental.chat.messages.transform": (input, output) => {
       try {
         const stats = { n: 0 }
@@ -533,6 +616,8 @@ ToolCallGuardPlugin.__test = {
   auditBody,
   sieveStage,
   AUDIT_Q,
+  preflightPattern,
+  SCANLIKE,
 }
 
 export default ToolCallGuardPlugin
