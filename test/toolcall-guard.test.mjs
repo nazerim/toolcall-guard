@@ -210,10 +210,11 @@ const { clipKind, analyzeMessages } = plugin.__test
 // 14. analyzeMessages: fires only on clean-stop + no-tool + clipped-text
 {
   const A = (parts, info) => [{ info: { role: "user", id: "u1" }, parts: [] }, { info: { role: "assistant", id: "a1", agent: "build", modelID: "m", providerID: "p", ...info }, parts }]
-  const clip = [{ type: "text", text: "plan step one `" }]
+  const clip = [{ type: "text", text: "plan step one `" }, { type: "step-finish" }]
   assert.equal(analyzeMessages(A(clip)).kind, "dangling-backtick")
-  assert.equal(analyzeMessages(A([{ type: "text", text: "" }])).kind, "empty")
-  assert.equal(analyzeMessages(A([{ type: "text", text: "all done." }])), null)
+  assert.equal(analyzeMessages(A([{ type: "text", text: "" }, { type: "step-finish" }])).kind, "empty")
+  assert.equal(analyzeMessages(A([{ type: "text", text: "all done." }, { type: "step-finish" }]))  , null)
+  assert.equal(analyzeMessages(A([{ type: "text", text: "plan step one `" }])), null, "aborted stream: no step-finish, never nudged")
   assert.equal(analyzeMessages(A([...clip, { type: "tool", tool: "bash" }]))?.kind ?? null, null)
   assert.equal(analyzeMessages(A(clip, { error: { name: "Aborted" } })), null)
   assert.equal(analyzeMessages(A(clip, { agent: "title" })), null)
