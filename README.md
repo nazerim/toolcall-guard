@@ -68,7 +68,9 @@ Applies automatically to every provider whose `npm` is
 Feature-flagged via environment; nothing below activates unless you set its
 flag. They share one dependency: a [Rizzo Flow](https://github.com/Rizzo-AI-Academy/rizzo-flow)
 decision server (local, Jev-compatible API, ~1.7 GB model) — if it is not
-reachable, every lane fails open silently.
+reachable, every lane fails open silently. Setup, the two API endpoints'
+exact shapes and gotchas, measured question-writing rules, and calibration:
+**[docs/rizzo-notes.md](docs/rizzo-notes.md)**.
 
 ### Turn audit — "did the agent stop with work left?"
 
