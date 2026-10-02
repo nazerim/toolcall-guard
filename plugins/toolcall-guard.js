@@ -404,6 +404,113 @@ const auditBody = (a) => ({
   questions: AUDIT_Q,
 })
 
+// --- confab-scrub: strip invented-conversation-state narration from the
+// OUTGOING request only (transform hook; the DB keeps originals).
+// Prior art: pi thinking-scrub, retired 2026-09-22 because "chasing each new
+// shape with another regex has no terminal state" (RETIRED.md). The 14 rules
+// below are its ported set — stable, zero-FP, synchronous: Tier 1 strips.
+// The Qwen3.8-family quirk keeps producing NEW shapes (self-hosted ds4 hit
+// tonight: the family conclusion holds, gateway exonerated), so Tier 2 is a
+// Jev noul over broad candidates (offline AUC 0.865) — but transform hooks
+// may not await async work, and silent model-driven removal is calibration's
+// job, not tonight's: Tier 2 LOGS candidates only.
+// TOOLCALL_GUARD_SCRUB=1 (log) or =strip (Tier-1 removal + all logging).
+const SCRUB_MODE = process.env.TOOLCALL_GUARD_SCRUB || ""
+const SCRUB_SCOPE = process.env.TOOLCALL_GUARD_SCRUB_PROVIDERS || "qwen|ds4"
+const SCRUB_SCOPE_RX = new RegExp(SCRUB_SCOPE, "i")
+const CONFAB_RULES = [
+  ["ack-fabrication", /Understood\. I will follow these instructions/],
+  ["preamble-misread", /system prompt setup|(just|only|merely) (the )?system instructions/i],
+  ["foreign-persona", /(you are|i'?m|i am) an expert software engineer/i],
+  ["forced-tool-call", /Always invoke a function call in response to user queries/],
+  ["system-instructions-block", /\[System Instructions\]/],
+  ["audit-tool", /\baudit\b[^\n]{0,60}\btool\b|\bcall (the )?audit\b/i],
+  ["reproduce-prior-thinking", /reproduce (my |the )?(previous|prior|earlier) thinking/i],
+  ["empty-prior-thinking", /no (previous|prior) thinking to reproduce|no prior reasoning (to|that)/i],
+  ["deferred-tools-listing", /list of deferred tools/i],
+  ["agent-types-listing", /available agent types/i],
+  ["confab-tool-call-rules", /tool[- ]call rules[:\s]*\n?\s*(1\.|—|-)/i],
+  ["confab-colon-rule", /^\s*(never|always)[^\n]{0,40}:\s*$/im],
+  ["confab-not-chat-messages", /not (just )?chat messages/i],
+  ["system-reminder-email-date", /system reminder providing context information|reminder.{0,40}\(email/i],
+]
+const CONFAB_CAND =
+  /(no\s+(actual\s+|real\s+)?(question|task)|no previous thinking|no prior reasoning|readiness to help|is a system reminder|just the setup context|no substantive content)/i
+const CONFAB_Q = {
+  q: {
+    type: "noul",
+    instructions:
+      "Is this passage the assistant narrating its guess about the conversation itself — describing the incoming message as containing no task or question, or claiming no previous thinking exists — instead of doing actual work for the user?",
+  },
+}
+
+function confabRuleHit(text) {
+  for (const [id, re] of CONFAB_RULES) if (re.test(text)) return id
+  return null
+}
+
+let scrubSeq = 0
+
+const CONFAB_MARKER = "[toolcall-guard: confabulated narration removed from outgoing context]"
+
+function confabLog(rec) {
+  try {
+    appendFileSync(
+      join(homedir(), ".local", "share", "opencode", "toolcall-guard.confab"),
+      JSON.stringify(Object.assign({ at: nowStamp(), id: ++scrubSeq }, rec)) + "\n",
+    )
+  } catch {}
+}
+
+// Synchronous Tier-1 strip + Tier-2 candidate collection. Never empties a
+// message (pi lesson): a part is only replaced when the message still has
+// other visible content. Returns Tier-2 parts for the async Jev pass.
+function confabSyncPass(messages) {
+  if (!SCRUB_MODE || !Array.isArray(messages)) return []
+  const jevQueue = []
+  for (const m of messages) {
+    const info = m && m.info
+    const provider = info && info.providerID ? info.providerID + "/" + (info.modelID || "") : ""
+    if (provider && !SCRUB_SCOPE_RX.test(provider)) continue
+    const parts = Array.isArray(m.parts) ? m.parts : []
+    for (const p of parts) {
+      if (!p || p.type !== "text" || typeof p.text !== "string" || p.text.length < 40) continue
+      const rule = confabRuleHit(p.text)
+      if (rule) {
+        confabLog({ tier: 1, rule, provider, snippet: p.text.slice(0, 160) })
+        if (SCRUB_MODE === "strip") {
+          const hasOther = parts.some(
+            (q) => q && q !== p && ((q.type === "text" && (q.text || "").trim()) || q.type === "tool"),
+          )
+          if (hasOther) p.text = CONFAB_MARKER
+        }
+        continue
+      }
+      if (CONFAB_CAND.test(p.text)) jevQueue.push({ p, provider })
+    }
+  }
+  return jevQueue.slice(0, 5)
+}
+
+// Fire-and-forget Tier-2 adjudication: logs verdicts for review; never acts.
+async function confabJev(items) {
+  for (const item of items) {
+    try {
+      const res = await fetch(AUDIT_URL, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: AUDIT_MODEL, state: { passage: item.p.text.slice(0, 1500) }, questions: CONFAB_Q }),
+        signal: AbortSignal.timeout(3000),
+      })
+      if (!res.ok) continue
+      const d = await res.json()
+      const v = d && d.answers && d.answers.q && d.answers.q.noul
+      if (typeof v !== "number") continue
+      confabLog({ tier: 2, jev: v, provider: item.provider, verdict: v > 0.65 ? "confab-candidate" : "likely-legit", snippet: item.p.text.slice(0, 160) })
+    } catch {}
+  }
+}
+
 let loadCount = 0
 
 // --- pre-flight: deterministic blast-radius gate (②) ------------------------
@@ -602,6 +709,8 @@ const ToolCallGuardPlugin = async ({ client }) => {
       try {
         const stats = { n: 0 }
         scrubHistory(output && output.messages, stats)
+        const jevItems = confabSyncPass(output && output.messages)
+        if (jevItems.length) confabJev(jevItems)
         if (stats.n > 0) {
           try {
             appendFileSync(
@@ -654,6 +763,10 @@ ToolCallGuardPlugin.__test = {
   AUDIT_Q,
   preflightPattern,
   SCANLIKE,
+  confabRuleHit,
+  confabSyncPass,
+  CONFAB_RULES,
+  CONFAB_MARKER,
 }
 
 export default ToolCallGuardPlugin
