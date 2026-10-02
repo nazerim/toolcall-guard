@@ -347,7 +347,7 @@ const AUDIT_Q = {
 }
 const QMARK = /\?\s*$/
 const OFFER =
-  /(when you (want|ask|say|decide|ready)|whenever you|say the word|let me know|just (say|ask|tell me)|your (call|turn|move|wish)|pending your|if you (want|like|prefer)|nothing (needed|pending)|restart (opencode|the)|i'?ll wait|waiting for you|reply (with|and)|ok to proceed|green light|tell me (which|what|if)|(now )?choose (one|any|from)|which (do you|would you) choose)/i
+  /(when you (want|ask|say|decide|ready)|whenever you|say the word|let me know|just (say|ask|tell me)|your (call|turn|move|wish)|pending your|if you (want|like|prefer)|nothing (needed|pending)|restart (opencode|the)|i'?ll wait|waiting for you|reply (with|and)|ok to proceed|green light|tell me (which|what|if)|(now )?choose (one|any|from)|which (do you|would you) choose|unless you (object|stop|tell me|say)|unless (i|i'?ve) hear|barring objection)/i
 const DANGLE_END = /[:\u2014,]\s*$/
 const DANGLE_BULLET = /^\s*[-*]\s+\S+[:\u2014]?\s*$/m
 

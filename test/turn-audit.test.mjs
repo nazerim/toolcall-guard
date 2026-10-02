@@ -16,6 +16,7 @@ const asst = (id, opts = {}) => ({
 assert.equal(sieveStage("Should I apply the patch to server.py?"), "question")
 assert.equal(sieveStage("All set — ready for the PR whenever you want it."), "offer")
 assert.equal(sieveStage("Say the word and I'll land it."), "offer")
+assert.equal(sieveStage("Proceeding with that unless you object."), "offer")
 assert.equal(sieveStage("Here's the state of play:"), "dangling")
 assert.equal(sieveStage("Remaining steps:\n- fit\n- refit"), "dangling")
 assert.equal(sieveStage("Two lanes remain\n- the fast path\n- the slow path"), "residue")
