@@ -23,7 +23,7 @@
 //     as plain text and the session survives;
 //   - well-formed streams pass through byte-identical.
 
-import { appendFileSync, writeFileSync } from "node:fs"
+import { appendFileSync, writeFileSync, readdirSync, statSync, unlinkSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 
@@ -596,21 +596,82 @@ function preflightPattern(cmd) {
 }
 const SCANLIKE = /(?:^|[\s;|&(])(grep\b[^\n]*\s-[a-zA-Z]*r|rg\s|find\s|ls\s+-[a-zA-Z]*R|du\s|tree\s)/
 
+// Input-side twin of the binary-output guard: an unbounded read of a
+// binary-extension file (cat/tac/od/xxd/strings/less/more/dd without
+// count=) spills its whole stream — opencode caps the CONTEXT copy but
+// writes the FULL output to disk unbounded (live incident: `cat
+// ds4flash.gguf` → 27 GB spill file; Claude Code's harness kills the
+// command at 5 GB instead). Exempt when the pipe target bounds it
+// (| head, | grep, | file …) or output is redirected. Extension-based
+// by design: file size is unknowable pre-exec without statting every
+// arg, and the NUL guard on the output side catches the rest.
+const BIN_READER = new Set(["cat", "tac", "od", "xxd", "strings", "less", "more", "dd"])
+const BIN_FILTER = new Set(["head", "tail", "wc", "grep", "rg", "cut", "file", "stat", "md5", "shasum", "cksum", "python", "python3", "node", "jq", "sort", "uniq", "awk", "sed", "base64", "diff", "cmp", "gzip", "unzip", "tar", "strings"])
+const BIN_EXT = /\.(gguf|ggml|safetensors|pt|pth|ckpt|onnx|npz|npy|joblib|pickle|bin|so|dylib|dll|class|jar|wasm|pyc|zip|gz|tgz|bz2|xz|zst|tar|pdf|png|jpe?g|gif|webp|ico|mp4|mov|mkv|avi|mp3|wav|flac|ogg|iso|dmg|pkg|deb|rpm|sqlite3?|pack|img|raw)$/i
+function binaryPeek(cmd) {
+  const segs = (cmd || "").split(/\s*(?:&&|\|\||[;|\n])\s*/)
+  for (let s = 0; s < segs.length; s++) {
+    const toks = segs[s].match(/"[^"]*"|'[^']*'|[^\s]+/g) || []
+    if (!BIN_READER.has(toks[0])) continue
+    const args = toks.slice(1)
+    if (args.some((a) => /^[0-9]?>{1,2}/.test(a))) continue
+    if (toks[0] === "dd" && args.some((a) => /^count=/.test(a))) continue
+    if (toks[0] === "xxd" && args.some((a) => a === "-l")) continue
+    if (!args.some((a) => BIN_EXT.test((a || "").replace(/^["']|["']$/g, "")))) continue
+    const nxt = (segs[s + 1] || "").match(/"[^"]*"|'[^']*'|[^\s]+/g) || []
+    if (nxt.length && BIN_FILTER.has(nxt[0])) continue
+    return "binary-peek"
+  }
+  return null
+}
+
+// Disk janitor: opencode's tool-output spill dir has no retention —
+// sweep files >1 GB untouched for >24 h (mtime recency guards an
+// in-flight spill). Runs once per opencode process at plugin init;
+// TOOLCALL_GUARD_JANITOR=0 disables.
+const JANITOR_ON = process.env.TOOLCALL_GUARD_JANITOR !== "0"
+function janitorSweep(dir, { maxBytes = 1e9, maxAgeMs = 86400000 } = {}) {
+  let deleted = 0
+  let bytes = 0
+  let names = []
+  try {
+    names = readdirSync(dir)
+  } catch {
+    return { deleted, bytes }
+  }
+  const now = Date.now()
+  for (const f of names) {
+    try {
+      const p = join(dir, f)
+      const st = statSync(p)
+      if (st.isFile() && st.size > maxBytes && now - st.mtimeMs > maxAgeMs) {
+        unlinkSync(p)
+        deleted++
+        bytes += st.size
+      }
+    } catch {}
+  }
+  return { deleted, bytes }
+}
+
 async function maybePreflight(input, output) {
   if (!PREFLIGHT_MODE) return
   if (input.tool !== "bash") return
   const cmd = (output.args && output.args.command) || ""
   const hit = preflightPattern(cmd)
-  if (hit) {
+  const peek = hit ? null : binaryPeek(cmd)
+  if (hit || peek) {
     try {
       appendFileSync(
         join(homedir(), ".local", "share", "opencode", "toolcall-guard.preflight"),
-        JSON.stringify({ at: nowStamp(), kind: "pattern", name: hit, mode: PREFLIGHT_MODE, cmd: cmd.slice(0, 200) }) + "\n",
+        JSON.stringify({ at: nowStamp(), kind: hit ? "pattern" : "binary-peek", name: hit || peek, mode: PREFLIGHT_MODE, cmd: cmd.slice(0, 200) }) + "\n",
       )
     } catch {}
     if (PREFLIGHT_MODE === "block")
       throw new Error(
-        `[toolcall-guard pre-flight] blocked ${hit}: recursive/filesystem-wide operation on an unbounded root. Narrow the path (project dir, --include, -maxdepth) and reissue.`,
+        hit
+          ? `[toolcall-guard pre-flight] blocked ${hit}: recursive/filesystem-wide operation on an unbounded root. Narrow the path (project dir, --include, -maxdepth) and reissue.`
+          : `[toolcall-guard pre-flight] blocked binary-peek: unbounded read of a binary file spills its whole stream (disk + context). Inspect with: file <path>; xxd -l 64 <path>; strings <path> | head -40.`,
       )
     return
   }
@@ -737,6 +798,17 @@ async function maybeAudit(sessionID, msgs, sessions) {
 
 const ToolCallGuardPlugin = async ({ client }) => {
   const sessions = new Map()
+  if (JANITOR_ON) {
+    const r = janitorSweep(join(homedir(), ".local", "share", "opencode", "tool-output"))
+    if (r.deleted > 0) {
+      try {
+        appendFileSync(
+          join(homedir(), ".local", "share", "opencode", "toolcall-guard.janitor"),
+          JSON.stringify({ at: nowStamp(), deleted: r.deleted, bytes: r.bytes }) + "\n",
+        )
+      } catch {}
+    }
+  }
   return {
     event: async ({ event }) => {
       try {
@@ -869,6 +941,8 @@ ToolCallGuardPlugin.__test = {
   sieveStage,
   AUDIT_Q,
   preflightPattern,
+  binaryPeek,
+  janitorSweep,
   SCANLIKE,
   confabRuleHit,
   confabSyncPass,
