@@ -90,10 +90,12 @@ TOOLCALL_GUARD_AUDIT=overnight opencode  # alert-grade thresholds
 
 Deterministic, model-free: logs zero-ambiguity unbounded commands
 (`rm -rf /`, `find ~`, `du $HOME`, … — quote-aware argv parsing, not
-substring grep). `=block` additionally refuses them. Optional clamp sets a
-timeout on scan-like commands that lack one (note: opencode's own default
-is already 120s — set `TOOLCALL_GUARD_CLAMP_MS` deliberately, below your
-effective `bashDefaultTimeoutMs`).
+substring grep) and binary-peek (`cat`/`od`/`strings` of a
+binary-extension file with no bounding pipe — one live `cat *.gguf`
+spilled 27 GB to disk). `=block` additionally refuses them. Optional
+clamp sets a timeout on scan-like commands that lack one (note:
+opencode's own default is already 120s — set `TOOLCALL_GUARD_CLAMP_MS`
+deliberately, below your effective `bashDefaultTimeoutMs`).
 
 ```bash
 TOOLCALL_GUARD_PREFLIGHT=1 opencode      # log only
@@ -134,6 +136,7 @@ Provider-scoped to `qwen|ds4` by default (`TOOLCALL_GUARD_SCRUB_PROVIDERS`).
 | `TOOLCALL_GUARD_CLAMP` / `_CLAMP_MS` | `1` / ms | off / 120000 |
 | `TOOLCALL_GUARD_SCRUB` | unset \| `1` \| `strip` | off |
 | `TOOLCALL_GUARD_BINARY` | `0` disables the binary-output guard (log path: `TOOLCALL_GUARD_BINARY_LOG`) | on |
+| `TOOLCALL_GUARD_JANITOR` | `0` disables the startup sweep of >1 GB, >24 h tool-output spills | on |
 | `TOOLCALL_GUARD_SCRUB_PROVIDERS` | regex | `qwen\|ds4` |
 | `TOOLCALL_GUARD_CONFAB_LOG` | log path override | real log (tests point here) |
 
@@ -142,7 +145,7 @@ passage) to the configured URL — localhost by default, never remote unless
 you point it there. Preflight logs command snippets; the confab log may
 contain quoted reasoning snippets. All logs live under
 `~/.local/share/opencode/toolcall-guard.*` (`audit`, `audit.shadow`,
-`preflight`, `confab`, `clips`, `scrubbed`, `idles`, `errors`, `loaded`).
+`preflight`, `confab`, `clips`, `scrubbed`, `idles`, `errors`, `loaded`, `binary`, `janitor`).
 
 ## Tests
 
