@@ -113,3 +113,18 @@ Audit lane: the last user message (≤1200 chars) + final assistant text tail
 (≤800 chars). Confab Tier 2: the candidate reasoning passage (≤1500 chars).
 localhost by default; `TOOLCALL_GUARD_RIZZO` lets you point elsewhere —
 don't, unless you mean to.
+
+## Known limit: deferred-work FPs (audit lane)
+
+The W2d question's "lists work that remains undone" clause does not
+distinguish work the agent owes **now** from work that is scheduled
+(cron), blocked (needs data/prereqs), or a documented backlog. Live soak
+(2026-10-02): 3 independent FPs of this shape, scores 0.52–0.92 —
+indistinguishable from a true stall by score alone at any threshold.
+Attempts: negation-scoped question (fixed FPs, collapsed the true
+positive into a 0.03 margin — noise); two-question cascade (worse, 3/5).
+Conclusion at the 1.7B's noise floor: **accepted as a known limit while
+the lane is observation-only**; revisit with larger labeled sets or
+richer state (e.g., including the turn's own tool activity, so claims
+like "all pushed" are verifiable). Deterministic half of the veto-idiom
+case ("unless you object" = user's move) is fixed in the OFFER sieve.
