@@ -37,10 +37,11 @@ today.
 | **Stream guard** (wraps each provider's `fetch`) | Server opens a `tool_calls` delta with `name:null` / missing id, or splits id/name across fragments → SDK throws → **turn aborts** | Buffers unknown-index fragments until id+name resolve, re-emits one valid opening fragment with merged args; trims backtick-wrapped names; coerces numeric ids; drops phantom calls that never resolve — the turn ends as plain text instead of dying |
 | **Outbound scrubber** (`experimental.chat.messages.transform`) | opencode replays `reasoning_content`/text verbatim, so a leaked/truncated special-token pattern stays in history and **re-arms the server's parser every turn** | Rewrites `<\|name\|>` in outbound history to `< \|name\| >` — parser-inert, readable, idempotent, self-healing |
 | **Auto-continue** (`event` on `session.idle`) | Server truncates generation at the pattern and closes with a clean `finish_reason:"stop"` — reply ends mid-sentence, **silently** | Detects clipped turns (stop + no tool call + empty or dangling-backtick text tail), sends one nudge ("your reply was truncated, resume from this tail, don't repeat"); once per message, max 3 per session, subagents skipped |
+| **Binary-output guard** (`tool.execute.after`) | `cat` of a model file / image / compiled artifact — NUL-bearing bytes flood the context AND the TUI, and opencode's truncator spills the **full** stream to disk (one live incident: 27 GB from `cat *.gguf`) | Rewrites NUL-bearing outputs (first-8 KB window) into a short notice: printable excerpt, the spill-file path, and safe inspection commands (`file`, `xxd -l 64`, `strings`) |
 
 Well-formed streams pass through **byte-identical**. With no environment
 flags set, all logic stays in-process — no network calls, no extra files
-beyond the three markers above. The optional lanes below (off by default)
+beyond the marker files above. The optional lanes below (off by default)
 talk to a **local** decision server and may send turn text to it; see each
 lane's privacy note.
 
@@ -132,6 +133,7 @@ Provider-scoped to `qwen|ds4` by default (`TOOLCALL_GUARD_SCRUB_PROVIDERS`).
 | `TOOLCALL_GUARD_PREFLIGHT` | unset \| `1` \| `block` | off |
 | `TOOLCALL_GUARD_CLAMP` / `_CLAMP_MS` | `1` / ms | off / 120000 |
 | `TOOLCALL_GUARD_SCRUB` | unset \| `1` \| `strip` | off |
+| `TOOLCALL_GUARD_BINARY` | `0` disables the binary-output guard (log path: `TOOLCALL_GUARD_BINARY_LOG`) | on |
 | `TOOLCALL_GUARD_SCRUB_PROVIDERS` | regex | `qwen\|ds4` |
 | `TOOLCALL_GUARD_CONFAB_LOG` | log path override | real log (tests point here) |
 
