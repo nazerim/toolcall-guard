@@ -48,9 +48,9 @@ assert.equal(confabRuleHit("The user asked me to check whether there is no actua
   confabSyncPass(msgs)
   assert.ok(p.text !== CONFAB_MARKER, "out-of-scope provider untouched")
 }
-// Broad candidate queueing (no rule hit, but CAND matches)
+// Broad candidate queueing: reasoning only — text parts are radar/log, not scored
 {
-  const p = { type: "text", text: "There is no real question in this message so I will consider what the user might want next and prepare some options for them to choose from later." }
+  const p = { type: "reasoning", text: "There is no real question in this message so I will consider what the user might want next and prepare some options for them to choose from later." }
   const msgs = [{ info: { providerID: "ds4-qwen", modelID: "qwen3.8" }, parts: [p] }]
   const jev = confabSyncPass(msgs)
   assert.equal(jev.length, 1, "CAND-only text queued for Jev")

@@ -490,7 +490,7 @@ function confabSyncPass(messages) {
         }
         continue
       }
-      if (CONFAB_CAND.test(p.text)) jevQueue.push({ p, provider })
+      if (p.type === "reasoning" && CONFAB_CAND.test(p.text)) jevQueue.push({ p, provider })
     }
   }
   return jevQueue.slice(0, 5)
