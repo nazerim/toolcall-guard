@@ -326,8 +326,9 @@ const NUDGE = (tail) =>
 const AUDIT_MODE = process.env.TOOLCALL_GUARD_AUDIT || ""
 const AUDIT_URL = process.env.TOOLCALL_GUARD_RIZZO || "http://127.0.0.1:8017/v1/systemone"
 const AUDIT_MODEL = process.env.TOOLCALL_GUARD_RIZZO_MODEL || "rizzo-flow-1.7b-q8_0"
-const AUDIT_T = process.env.TOOLCALL_GUARD_AUDIT_T
-  ? Number(process.env.TOOLCALL_GUARD_AUDIT_T)
+const AUDIT_T_RAW = Number(process.env.TOOLCALL_GUARD_AUDIT_T)
+const AUDIT_T = Number.isFinite(AUDIT_T_RAW) && process.env.TOOLCALL_GUARD_AUDIT_T
+  ? AUDIT_T_RAW
   : AUDIT_MODE === "overnight"
     ? 0.6
     : 0.5
@@ -346,14 +347,16 @@ const AUDIT_Q = {
 }
 const QMARK = /\?\s*$/
 const OFFER =
-  /(when you (want|ask|say|decide|ready)|whenever you|say the word|let me know|just (say|ask|tell me)|your (call|turn|move|wish)|pending your|if you (want|like|prefer)|nothing (needed|pending)|restart (opencode|the)|i'?ll wait|waiting for you|reply (with|and)|ok to proceed|green light|tell me (which|what|if)|choose|pick one)/i
-const DANGLE = /[:\u2014,]\s*$|^\s*[-*]\s+\S+[:\u2014]?\s*$/m
+  /(when you (want|ask|say|decide|ready)|whenever you|say the word|let me know|just (say|ask|tell me)|your (call|turn|move|wish)|pending your|if you (want|like|prefer)|nothing (needed|pending)|restart (opencode|the)|i'?ll wait|waiting for you|reply (with|and)|ok to proceed|green light|tell me (which|what|if)|(now )?choose (one|any|from)|which (do you|would you) choose)/i
+const DANGLE_END = /[:\u2014,]\s*$/
+const DANGLE_BULLET = /^\s*[-*]\s+\S+[:\u2014]?\s*$/m
 
 function sieveStage(text) {
   const e = (text || "").trimEnd()
   if (QMARK.test(e)) return "question"
-  if (OFFER.test(e.slice(-350))) return "offer"
-  if (DANGLE.test(e.slice(-200))) return "dangling"
+  if (OFFER.test(e.slice(-120))) return "offer"
+  if (DANGLE_END.test(e.slice(-200))) return "dangling"
+  if (DANGLE_BULLET.test(e.slice(-80))) return "dangling"
   return "residue"
 }
 
@@ -366,7 +369,8 @@ function analyzeAudit(msgs) {
     }
   }
   if (lastIdx < 0) return null
-  const { info, parts = [] } = msgs[lastIdx]
+  const { info } = msgs[lastIdx]
+  const parts = msgs[lastIdx].parts || []
   if (info.error) return null
   if (!parts.some((p) => p && p.type === "step-finish")) return null
   if (["title", "summary", "compaction"].includes(info.agent)) return null
@@ -417,14 +421,19 @@ const auditBody = (a) => ({
 // TOOLCALL_GUARD_SCRUB=1 (log) or =strip (Tier-1 removal + all logging).
 const SCRUB_MODE = process.env.TOOLCALL_GUARD_SCRUB || ""
 const SCRUB_SCOPE = process.env.TOOLCALL_GUARD_SCRUB_PROVIDERS || "qwen|ds4"
-const SCRUB_SCOPE_RX = new RegExp(SCRUB_SCOPE, "i")
+let SCRUB_SCOPE_RX
+try {
+  SCRUB_SCOPE_RX = new RegExp(SCRUB_SCOPE, "i")
+} catch {
+  SCRUB_SCOPE_RX = /qwen|ds4/i
+}
 const CONFAB_RULES = [
   ["ack-fabrication", /Understood\. I will follow these instructions/],
   ["preamble-misread", /system prompt setup|(just|only|merely) (the )?system instructions/i],
   ["foreign-persona", /(you are|i'?m|i am) an expert software engineer/i],
   ["forced-tool-call", /Always invoke a function call in response to user queries/],
   ["system-instructions-block", /\[System Instructions\]/],
-  ["audit-tool", /\baudit\b[^\n]{0,60}\btool\b|\bcall (the )?audit\b/i],
+  ["audit-tool", /\baudit\b[^\n]{0,60}\btool\b|\bcall (the )?audit\b/i, /no (previous|prior) thinking|reproduce|no actual|system (prompt|instructions|reminder)/i],
   ["reproduce-prior-thinking", /reproduce (my |the )?(previous|prior|earlier) thinking/i],
   ["empty-prior-thinking", /no (previous|prior) thinking to reproduce|no prior reasoning (to|that)/i],
   ["deferred-tools-listing", /list of deferred tools/i],
@@ -445,7 +454,7 @@ const CONFAB_Q = {
 }
 
 function confabRuleHit(text) {
-  for (const [id, re] of CONFAB_RULES) if (re.test(text)) return id
+  for (const r of CONFAB_RULES) if (r[1].test(text) && (!r[2] || r[2].test(text))) return r[0]
   return null
 }
 
@@ -456,8 +465,8 @@ const CONFAB_MARKER = "[toolcall-guard: confabulated narration removed from outg
 function confabLog(rec) {
   try {
     appendFileSync(
-      join(homedir(), ".local", "share", "opencode", "toolcall-guard.confab"),
-      JSON.stringify(Object.assign({ at: nowStamp(), id: ++scrubSeq }, rec)) + "\n",
+      process.env.TOOLCALL_GUARD_CONFAB_LOG || join(homedir(), ".local", "share", "opencode", "toolcall-guard.confab"),
+      JSON.stringify(Object.assign({ at: nowStamp(), id: process.pid + "-" + ++scrubSeq }, rec)) + "\n",
     )
   } catch {}
 }
@@ -469,28 +478,44 @@ function confabLog(rec) {
 // Text-part hits are LOGGED, never stripped (visible replies are the user's
 // surface). Never empties a message (pi lesson). Returns Tier-2 parts for
 // the async Jev pass.
+const confabSeen = new Set()
+function confabKey(p) {
+  return p.id || (p.text || "").slice(0, 120)
+}
+const hasContent = (q) =>
+  q && ((q.type === "text" || q.type === "reasoning") ? typeof q.text === "string" && q.text.trim() : q.type === "tool")
+
 function confabSyncPass(messages) {
   if (!SCRUB_MODE || !Array.isArray(messages)) return []
   const jevQueue = []
   for (const m of messages) {
     const info = m && m.info
+    if (info && info.role && info.role !== "assistant") continue
     const provider = info && info.providerID ? info.providerID + "/" + (info.modelID || "") : ""
     if (provider && !SCRUB_SCOPE_RX.test(provider)) continue
     const parts = Array.isArray(m.parts) ? m.parts : []
+    const hits = []
     for (const p of parts) {
       if (!p || (p.type !== "reasoning" && p.type !== "text") || typeof p.text !== "string" || p.text.length < 40) continue
+      const key = m.info && m.info.id ? m.info.id + ":" + confabKey(p) : confabKey(p)
+      if (confabSeen.has(key)) continue
+      if (confabSeen.size > 4000) confabSeen.clear()
+      confabSeen.add(key)
       const rule = confabRuleHit(p.text)
       if (rule) {
         confabLog({ tier: 1, rule, ptype: p.type, provider, snippet: p.text.slice(0, 160) })
-        if (SCRUB_MODE === "strip" && p.type === "reasoning") {
-          const hasOther = parts.some(
-            (q) => q && q !== p && ((q.type === "text" && (q.text || "").trim()) || q.type === "tool" || q.type === "reasoning"),
-          )
-          if (hasOther) p.text = CONFAB_MARKER
-        }
+        if (SCRUB_MODE === "strip" && p.type === "reasoning") hits.push(p)
         continue
       }
       if (p.type === "reasoning" && CONFAB_CAND.test(p.text)) jevQueue.push({ p, provider })
+    }
+    // two-pass never-empty: a part counts as surviving content only if it is
+    // not itself being stripped and holds non-whitespace (reviewer #1: two
+    // confab reasonings must not mutually qualify each other for stripping)
+    if (hits.length) {
+      for (const p of hits) {
+        if (parts.some((q) => q !== p && !hits.includes(q) && hasContent(q))) p.text = CONFAB_MARKER
+      }
     }
   }
   return jevQueue.slice(0, 5)
@@ -530,21 +555,46 @@ let loadCount = 0
 //      output denominator is measured in the wild, feeding later policy.
 const PREFLIGHT_MODE = process.env.TOOLCALL_GUARD_PREFLIGHT || ""
 const CLAMP_ON = process.env.TOOLCALL_GUARD_CLAMP === "1"
-const CLAMP_MS = 120000
-const DANGER = [
-  [/\bgrep\b[^\n]*\s-[a-zA-Z]*r[a-zA-Z]*\b/, /(?:^|\s)(?:\/|~\/?|\$HOME\/?)(?=\s|$)/, "recursive-grep-root"],
-  [/\bfind\s+(?:\/|~\/?|\$HOME\/?)(?=\s|$)/, null, "find-root"],
-  [/\brm\s+-[a-zA-Z]*r[a-zA-Z]*f?\s+(?:\/|~\/?|\$HOME\/?)(?=\s|$)/, null, "rm-rf-unbounded"],
-  [/\bls\s+-[a-zA-Z]*R[a-zA-Z]*\s+(?:\/|~\/?|\$HOME\/?)(?=\s|$)/, null, "ls-R-root"],
-  [/\bdu\b[^\n]*\s(?:\/|~\/?|\$HOME\/?)\s*$/, null, "du-root"],
-]
-const SCANLIKE = /\b(grep\b[^\n]*\s-[a-zA-Z]*r|rg\b|find\b|ls\s+-[a-zA-Z]*R|du\b|tree\b)/
+// Note: opencode's own default bash timeout is 120s (bashDefaultTimeoutMs),
+// so the clamp only bites when the operator RAISED the default or a command
+// passes an explicit huge timeout — CLAMP_MS must therefore stay below the
+// effective default to be meaningful; env lets you set it deliberately.
+const CLAMP_MS = Number(process.env.TOOLCALL_GUARD_CLAMP_MS) || 120000
+// Token-level danger analysis (reviewer #7/#16): substring regexes miss
+// split flags (rm -r -f /), quoted roots (rm -rf "$HOME") and false-positive
+// on quoted content (grep -rn " / " ./logs). We tokenize, strip one layer of
+// quoting for ROOT tests only, and check per-command argv shape.
+const ROOT_TOKEN = /^(?:\/|~\/?|\$HOME\/?|\$\{HOME\}\/?)$/
+const isRootTok = (t) => ROOT_TOKEN.test((t || "").replace(/^["']|["']$/g, ""))
+function tokenize(cmd) {
+  const out = []
+  for (const seg of (cmd || "").split(/[;\n]+/)) {
+    const m = seg.match(/"[^"]*"|'[^']*'|[^\s|]+/g) || []
+    for (const t of m) if (t !== "|") out.push(t)
+    out.push("|")
+  }
+  return out
+}
+const flagTok = (t, re) => t.startsWith("-") && re.test(t)
 
 function preflightPattern(cmd) {
-  const c = cmd || ""
-  for (const [a, b, name] of DANGER) if (a.test(c) && (!b || b.test(c))) return name
+  const toks = tokenize(cmd)
+  for (let i = 0; i < toks.length; i++) {
+    const t = toks[i]
+    if (t !== "rm" && t !== "grep" && t !== "rg" && t !== "find" && t !== "ls" && t !== "du" && t !== "tree") continue
+    const argv = []
+    for (let j = i + 1; j < toks.length && toks[j] !== "|" && !["rm","grep","rg","find","ls","du","tree"].includes(toks[j]); j++) argv.push(toks[j])
+    const roots = argv.filter(isRootTok)
+    if (!roots.length) continue
+    if (t === "rm" && argv.some((a) => flagTok(a, /r/i)) && argv.some((a) => flagTok(a, /f/i))) return "rm-rf-unbounded"
+    if ((t === "grep" || t === "rg") && argv.some((a) => flagTok(a, /r/i))) return "recursive-grep-root"
+    if (t === "find" && argv[0] && isRootTok(argv[0])) return "find-root"
+    if (t === "ls" && argv.some((a) => flagTok(a, /R/))) return "ls-R-root"
+    if (t === "du") return "du-root"
+  }
   return null
 }
+const SCANLIKE = /(?:^|[\s;|&(])(grep\b[^\n]*\s-[a-zA-Z]*r|rg\s|find\s|ls\s+-[a-zA-Z]*R|du\s|tree\s)/
 
 async function maybePreflight(input, output) {
   if (!PREFLIGHT_MODE) return
@@ -618,8 +668,6 @@ async function maybeAudit(sessionID, msgs, sessions) {
     return
   }
   if (st.audited.has(a.messageID) || st.auditCount >= 15) return
-  st.audited.add(a.messageID)
-  st.auditCount++
   const t0 = Date.now()
   let p
   let probs
@@ -634,10 +682,16 @@ async function maybeAudit(sessionID, msgs, sessions) {
     const d = await res.json()
     probs = d && d.answers && d.answers.q && d.answers.q.probabilities
     p = probs && probs.assistant
-    if (typeof p !== "number") return
+    if (typeof p !== "number") {
+      log({ stage: "residue", error: "bad-response" })
+      return
+    }
   } catch {
+    log({ stage: "residue", error: "fetch" })
     return
   }
+  st.audited.add(a.messageID)
+  st.auditCount++
   const fired = p > AUDIT_T
   log({ stage: "residue", p, probs, fired, why: fired ? "assistant-move" : "ok", ms: Date.now() - t0 })
 }
@@ -650,6 +704,7 @@ const ToolCallGuardPlugin = async ({ client }) => {
         if (!event || event.type !== "session.idle") return
         const sessionID = event.properties && event.properties.sessionID
         if (!sessionID || !client) return
+        if (!AUDIT_MODE && !PREFLIGHT_MODE && !SCRUB_MODE) return
         try {
           appendFileSync(
             join(homedir(), ".local", "share", "opencode", "toolcall-guard.idles"),
@@ -701,7 +756,13 @@ const ToolCallGuardPlugin = async ({ client }) => {
       try {
         await maybePreflight(input, output)
       } catch (e) {
-        if (String(e && e.message).startsWith("[toolcall-guard pre-flight]")) throw e
+        if (String((e && e.message) || "").startsWith("[toolcall-guard pre-flight]")) throw e
+        try {
+          appendFileSync(
+            join(homedir(), ".local", "share", "opencode", "toolcall-guard.errors"),
+            JSON.stringify({ at: nowStamp(), lane: "preflight", err: String((e && e.message) || e).slice(0, 300) }) + "\n",
+          )
+        } catch {}
       }
     },
     "tool.execute.after": async (input, output) => {

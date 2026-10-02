@@ -21,6 +21,13 @@ assert.equal(preflightPattern("rm -rf jev-local/rizzo-flow"), null)
 assert.equal(preflightPattern("ls -la ~/Downloads"), null)
 assert.equal(preflightPattern("du -sh ./node_modules"), null)
 
+// reviewer regressions: split flags, quoted roots, quoted " / "
+assert.equal(preflightPattern("rm -r -f /"), "rm-rf-unbounded")
+assert.equal(preflightPattern('rm -rf "$HOME"'), "rm-rf-unbounded")
+assert.equal(preflightPattern('grep -rn " / " ./logs'), null)
+assert.equal(preflightPattern('git commit -m "fix: find / replace bug"'), null)
+assert.equal(preflightPattern("npm run find-deps"), null)
+
 // scanlike drives the timeout clamp only when no explicit timeout set (checked in hook)
 assert.ok(SCANLIKE.test("grep -rn 'x' ./big-project"))
 assert.ok(SCANLIKE.test("find ./tree -name '*.log'"))
