@@ -638,6 +638,45 @@ function preflightAfter(input, output) {
   }
 }
 
+// Binary-output guard (default ON; TOOLCALL_GUARD_BINARY=0 to disable).
+// Sibling of the clip heuristic: deterministic output hygiene, no judgment.
+// A tool result containing NUL bytes is raw binary (cat of a model file,
+// a .so, an image) — leaking it into context AND the TUI is pure damage
+// (live incident 2026-10-02: `cat ds4flash.gguf` → 26 KB of NUL-bearing
+// text). Verified against opencode 1.18.34 source (session/tools.ts):
+// tool.execute.after mutates `output` in place and the same object is
+// returned to the model, so rewriting output.output is sound.
+// Detection window is the first 8 KB: opencode's own truncator keeps the
+// head, so binary content always shows up in the window we scan.
+const BINARY_ON = process.env.TOOLCALL_GUARD_BINARY !== "0"
+function binaryGuard(input, output) {
+  if (!BINARY_ON || !output || typeof output.output !== "string") return false
+  const out = output.output
+  const head = out.slice(0, 8192)
+  if (!head.includes("\0")) return false
+  let ctrl = 0
+  for (const ch of head) {
+    const c = ch.charCodeAt(0)
+    if (c === 0 || (c < 32 && c !== 9 && c !== 10 && c !== 13)) ctrl++
+  }
+  const printable = head.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "").slice(0, 200)
+  const saved = (out.match(/Full output saved to:\s*(\S+)/) || [])[1] || ""
+  const cmd = ((input && input.args && (input.args.command || input.args.filePath)) || "").toString().slice(0, 160)
+  output.output =
+    `[toolcall-guard] binary output suppressed: ${input.tool} returned ${out.length} chars with ${ctrl} control/NUL bytes in the first 8 KB (raw binary — likely a model file, image, or compiled artifact). ` +
+    (printable ? `Printable excerpt: ${JSON.stringify(printable)} ` : "") +
+    (saved ? `Full raw output on disk: ${saved} ` : "") +
+    `To inspect safely: file <path>, xxd -l 64 <path>, strings <path> | head -40.`
+  try {
+    appendFileSync(
+      process.env.TOOLCALL_GUARD_BINARY_LOG ||
+        join(homedir(), ".local", "share", "opencode", "toolcall-guard.binary"),
+      JSON.stringify({ at: nowStamp(), sessionID: input.sessionID, tool: input.tool, bytes: out.length, ctrl, cmd }) + "\n",
+    )
+  } catch {}
+  return true
+}
+
 async function maybeAudit(sessionID, msgs, sessions) {
   if (!AUDIT_MODE) return
   const a = analyzeAudit(msgs)
@@ -767,6 +806,9 @@ const ToolCallGuardPlugin = async ({ client }) => {
     },
     "tool.execute.after": async (input, output) => {
       try {
+        binaryGuard(input, output)
+      } catch {}
+      try {
         preflightAfter(input, output)
       } catch {}
     },
@@ -832,6 +874,7 @@ ToolCallGuardPlugin.__test = {
   confabSyncPass,
   CONFAB_RULES,
   CONFAB_MARKER,
+  binaryGuard,
 }
 
 export default ToolCallGuardPlugin
