@@ -462,9 +462,13 @@ function confabLog(rec) {
   } catch {}
 }
 
-// Synchronous Tier-1 strip + Tier-2 candidate collection. Never empties a
-// message (pi lesson): a part is only replaced when the message still has
-// other visible content. Returns Tier-2 parts for the async Jev pass.
+// Synchronous Tier-1 strip + Tier-2 candidate collection. Primary target is
+// REASONING parts — where the artifact manifests and what replay poisons
+// (10/12 corpus hits); transform-scrub is retroactive: contaminated old
+// sessions get cleaned on every future resume, DB keeps originals.
+// Text-part hits are LOGGED, never stripped (visible replies are the user's
+// surface). Never empties a message (pi lesson). Returns Tier-2 parts for
+// the async Jev pass.
 function confabSyncPass(messages) {
   if (!SCRUB_MODE || !Array.isArray(messages)) return []
   const jevQueue = []
@@ -474,13 +478,13 @@ function confabSyncPass(messages) {
     if (provider && !SCRUB_SCOPE_RX.test(provider)) continue
     const parts = Array.isArray(m.parts) ? m.parts : []
     for (const p of parts) {
-      if (!p || p.type !== "text" || typeof p.text !== "string" || p.text.length < 40) continue
+      if (!p || (p.type !== "reasoning" && p.type !== "text") || typeof p.text !== "string" || p.text.length < 40) continue
       const rule = confabRuleHit(p.text)
       if (rule) {
-        confabLog({ tier: 1, rule, provider, snippet: p.text.slice(0, 160) })
-        if (SCRUB_MODE === "strip") {
+        confabLog({ tier: 1, rule, ptype: p.type, provider, snippet: p.text.slice(0, 160) })
+        if (SCRUB_MODE === "strip" && p.type === "reasoning") {
           const hasOther = parts.some(
-            (q) => q && q !== p && ((q.type === "text" && (q.text || "").trim()) || q.type === "tool"),
+            (q) => q && q !== p && ((q.type === "text" && (q.text || "").trim()) || q.type === "tool" || q.type === "reasoning"),
           )
           if (hasOther) p.text = CONFAB_MARKER
         }

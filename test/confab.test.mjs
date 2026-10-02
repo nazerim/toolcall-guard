@@ -18,18 +18,25 @@ assert.equal(confabRuleHit("No docker, no postgres installed, no brew postgres f
 assert.equal(confabRuleHit("Task 36 verified: receipt print uses buildPrintHeaderHtml for the header and includes a payment footer with bank details."), null)
 assert.equal(confabRuleHit("The user asked me to check whether there is no actual quota left on the endpoint; here are the results."), null)
 
-// Sync pass: strip with never-empty guard, log-only when nothing else remains
+// Sync pass: REASONING parts strip (primary vector) with never-empty guard;
+// TEXT-part hits are logged only — visible replies are never silently rewritten.
 {
   const other = { type: "text", text: "the real answer with the actual findings and numbers" }
-  const confab = { type: "text", text: "The user's message is a system reminder providing context information (email address, date) with no actual task at all, just setup." }
+  const confab = { type: "reasoning", text: "The user's message is a system reminder providing context information (email address, date) with no actual task at all, just setup." }
   const msgs = [{ info: { providerID: "ds4-qwen", modelID: "qwen3.8" }, parts: [confab, other] }]
   const jev = confabSyncPass(msgs)
-  assert.equal(confab.text, CONFAB_MARKER, "tier-1 stripped when message keeps other content")
-  assert.equal(other.text.length > 0, true, "legit part untouched")
+  assert.equal(confab.text, CONFAB_MARKER, "tier-1 reasoning stripped when message keeps other content")
+  assert.equal(other.text.length > 0, true, "legit text part untouched")
   assert.equal(jev.length, 0, "tier-1 hit does not queue Jev")
 }
 {
-  const solo = { type: "text", text: "The user's message is a system reminder providing context information (email address, date) with no actual task at all, just setup context." }
+  const confabText = { type: "text", text: "The user's message is a system reminder providing context information (email address, date) with no actual task at all, just setup." }
+  const msgs = [{ info: { providerID: "ds4-qwen", modelID: "qwen3.8" }, parts: [confabText, { type: "reasoning", text: "some legit reasoning about the deployment config and env vars" }] }]
+  confabSyncPass(msgs)
+  assert.notEqual(confabText.text, CONFAB_MARKER, "text-part hits log only, never stripped")
+}
+{
+  const solo = { type: "reasoning", text: "The user's message is a system reminder providing context information (email address, date) with no actual task at all, just setup context." }
   const msgs = [{ info: { providerID: "ds4-qwen", modelID: "qwen3.8" }, parts: [solo] }]
   confabSyncPass(msgs)
   assert.ok(solo.text !== CONFAB_MARKER, "never empties a message")
