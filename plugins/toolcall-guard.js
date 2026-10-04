@@ -321,10 +321,29 @@ const NUDGE = (tail) =>
 // trade at matched FP on 200+200 offline sets; AUC 0.748, zero position bias,
 // 1.7B beats 4B). Fire = P(assistant) above threshold. Observation ONLY —
 // never prompts the session; the log is the label stream for calibration.
+// Lanes DEFAULT ON (soak coverage showed launch-line env vars starve the
+// data: 6 sessions in 2 days). Opt out per lane with =off (or =0);
+// TOOLCALL_GUARD=off disables every optional lane at once. Model-backed
+// lanes additionally self-disable while the local decision server is
+// unreachable (liveness probe at init + every 60s).
 // TOOLCALL_GUARD_AUDIT=1 (interactive, T=0.5) or =overnight (T=0.6);
 // TOOLCALL_GUARD_AUDIT_T overrides.
-const AUDIT_MODE = process.env.TOOLCALL_GUARD_AUDIT || ""
+const MASTER_OFF = (process.env.TOOLCALL_GUARD || "").toLowerCase() === "off"
+const laneOff = (v) => MASTER_OFF || v === "off" || v === "0"
+const rawAudit = (process.env.TOOLCALL_GUARD_AUDIT || "").toLowerCase()
+const AUDIT_MODE = laneOff(rawAudit) ? "" : rawAudit || "1"
 const AUDIT_URL = process.env.TOOLCALL_GUARD_RIZZO || "http://127.0.0.1:8017/v1/systemone"
+let RIZZO_LIVE = false
+async function probeRizzo() {
+  try {
+    const u = new URL(AUDIT_URL)
+    u.pathname = "/v1/models"
+    const r = await fetch(u, { signal: AbortSignal.timeout(1500) })
+    RIZZO_LIVE = r.ok
+  } catch {
+    RIZZO_LIVE = false
+  }
+}
 const AUDIT_MODEL = process.env.TOOLCALL_GUARD_RIZZO_MODEL || "rizzo-flow-1.7b-q8_0"
 const AUDIT_T_RAW = Number(process.env.TOOLCALL_GUARD_AUDIT_T)
 const AUDIT_T = Number.isFinite(AUDIT_T_RAW) && process.env.TOOLCALL_GUARD_AUDIT_T
@@ -418,8 +437,9 @@ const auditBody = (a) => ({
 // Jev noul over broad candidates (offline AUC 0.865) — but transform hooks
 // may not await async work, and silent model-driven removal is calibration's
 // job, not tonight's: Tier 2 LOGS candidates only.
-// TOOLCALL_GUARD_SCRUB=1 (log) or =strip (Tier-1 removal + all logging).
-const SCRUB_MODE = process.env.TOOLCALL_GUARD_SCRUB || ""
+// TOOLCALL_GUARD_SCRUB=1 (log) or =strip (Tier-1 removal + all logging); =off disables.
+const rawScrub = (process.env.TOOLCALL_GUARD_SCRUB || "").toLowerCase()
+const SCRUB_MODE = laneOff(rawScrub) ? "" : rawScrub || "1"
 const SCRUB_SCOPE = process.env.TOOLCALL_GUARD_SCRUB_PROVIDERS || "qwen|ds4"
 let SCRUB_SCOPE_RX
 try {
@@ -523,6 +543,7 @@ function confabSyncPass(messages) {
 
 // Fire-and-forget Tier-2 adjudication: logs verdicts for review; never acts.
 async function confabJev(items) {
+  if (!RIZZO_LIVE) return
   for (const item of items) {
     try {
       const res = await fetch(AUDIT_URL, {
@@ -553,7 +574,8 @@ let loadCount = 0
 //      TOOLCALL_GUARD_CLAMP=1, caps at 120s;
 //  (c) tool.execute.after records giant outputs (>50 KB) so the runaway-
 //      output denominator is measured in the wild, feeding later policy.
-const PREFLIGHT_MODE = process.env.TOOLCALL_GUARD_PREFLIGHT || ""
+const rawPf = (process.env.TOOLCALL_GUARD_PREFLIGHT || "").toLowerCase()
+const PREFLIGHT_MODE = laneOff(rawPf) ? "" : rawPf || "1"
 const CLAMP_ON = process.env.TOOLCALL_GUARD_CLAMP === "1"
 // Note: opencode's own default bash timeout is 120s (bashDefaultTimeoutMs),
 // so the clamp only bites when the operator RAISED the default or a command
@@ -629,7 +651,7 @@ function binaryPeek(cmd) {
 // sweep files >1 GB untouched for >24 h (mtime recency guards an
 // in-flight spill). Runs once per opencode process at plugin init;
 // TOOLCALL_GUARD_JANITOR=0 disables.
-const JANITOR_ON = process.env.TOOLCALL_GUARD_JANITOR !== "0"
+const JANITOR_ON = !MASTER_OFF && process.env.TOOLCALL_GUARD_JANITOR !== "0"
 function janitorSweep(dir, { maxBytes = 1e9, maxAgeMs = 86400000 } = {}) {
   let deleted = 0
   let bytes = 0
@@ -709,7 +731,7 @@ function preflightAfter(input, output) {
 // returned to the model, so rewriting output.output is sound.
 // Detection window is the first 8 KB: opencode's own truncator keeps the
 // head, so binary content always shows up in the window we scan.
-const BINARY_ON = process.env.TOOLCALL_GUARD_BINARY !== "0"
+const BINARY_ON = !MASTER_OFF && process.env.TOOLCALL_GUARD_BINARY !== "0"
 function binaryGuard(input, output) {
   if (!BINARY_ON || !output || typeof output.output !== "string") return false
   const out = output.output
@@ -739,7 +761,7 @@ function binaryGuard(input, output) {
 }
 
 async function maybeAudit(sessionID, msgs, sessions) {
-  if (!AUDIT_MODE) return
+  if (!AUDIT_MODE || !RIZZO_LIVE) return
   const a = analyzeAudit(msgs)
   if (!a) return
   let st = sessions.get(sessionID)
@@ -798,6 +820,11 @@ async function maybeAudit(sessionID, msgs, sessions) {
 
 const ToolCallGuardPlugin = async ({ client }) => {
   const sessions = new Map()
+  if (AUDIT_MODE) {
+    await probeRizzo()
+    const t = setInterval(probeRizzo, 60000)
+    if (t.unref) t.unref()
+  }
   if (JANITOR_ON) {
     const r = janitorSweep(join(homedir(), ".local", "share", "opencode", "tool-output"))
     if (r.deleted > 0) {
@@ -824,9 +851,16 @@ const ToolCallGuardPlugin = async ({ client }) => {
         } catch {}
         const sess = await client.session.get({ path: { id: sessionID } })
         const sdata = sess && sess.data
-        if (sdata && sdata.parentID) return
+        const isSub = !!(sdata && sdata.parentID)
         const res = await client.session.messages({ path: { id: sessionID }, query: { limit: 10 } })
         const msgs = (res && res.data) || res
+        if (isSub) {
+          // Subagents: observation only, always. Nudging a subagent would
+          // fight the orchestrator; auditing their final turns is the
+          // richest stop data we have (handoff queues, flat closes).
+          await maybeAudit(sessionID, msgs, sessions)
+          return
+        }
         const a = analyzeMessages(msgs)
         if (!a) {
           await maybeAudit(sessionID, msgs, sessions)
@@ -949,6 +983,10 @@ ToolCallGuardPlugin.__test = {
   CONFAB_RULES,
   CONFAB_MARKER,
   binaryGuard,
+  AUDIT_MODE,
+  PREFLIGHT_MODE,
+  SCRUB_MODE,
+  BINARY_ON,
 }
 
 export default ToolCallGuardPlugin

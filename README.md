@@ -39,11 +39,14 @@ today.
 | **Auto-continue** (`event` on `session.idle`) | Server truncates generation at the pattern and closes with a clean `finish_reason:"stop"` — reply ends mid-sentence, **silently** | Detects clipped turns (stop + no tool call + empty or dangling-backtick text tail), sends one nudge ("your reply was truncated, resume from this tail, don't repeat"); once per message, max 3 per session, subagents skipped |
 | **Binary-output guard** (`tool.execute.after`) | `cat` of a model file / image / compiled artifact — NUL-bearing bytes flood the context AND the TUI, and opencode's truncator spills the **full** stream to disk (one live incident: 27 GB from `cat *.gguf`) | Rewrites NUL-bearing outputs (first-8 KB window) into a short notice: printable excerpt, the spill-file path, and safe inspection commands (`file`, `xxd -l 64`, `strings`) |
 
-Well-formed streams pass through **byte-identical**. With no environment
-flags set, all logic stays in-process — no network calls, no extra files
-beyond the marker files above. The optional lanes below (off by default)
-talk to a **local** decision server and may send turn text to it; see each
-lane's privacy note.
+Well-formed streams pass through **byte-identical**. The observation lanes
+are **on by default** (a launch-line-env soak collected only 6 sessions
+in 2 days — coverage demanded defaults): they write marker files and,
+when a **local** decision server is reachable on `127.0.0.1`, send turn
+text to it; model-backed lanes self-disable while the server is
+unreachable. `TOOLCALL_GUARD=off` disables every optional lane; per-lane
+`off`/`0` opts out individually. The stream guard + scrubber core is not
+affected. See each lane's privacy note.
 
 ## Install
 
@@ -64,7 +67,7 @@ Applies automatically to every provider whose `npm` is
 ~/.local/share/opencode/toolcall-guard.clips      # auto-continue firings
 ```
 
-## Optional lanes (off by default)
+## Observation lanes (on by default; `off` to opt out)
 
 Feature-flagged via environment; nothing below activates unless you set its
 flag. They share one dependency: a [Rizzo Flow](https://github.com/Rizzo-AI-Academy/rizzo-flow)
@@ -128,13 +131,14 @@ Provider-scoped to `qwen|ds4` by default (`TOOLCALL_GUARD_SCRUB_PROVIDERS`).
 
 | Var | Values | Default |
 |---|---|---|
-| `TOOLCALL_GUARD_AUDIT` | unset \| `1` \| `overnight` | off |
+| `TOOLCALL_GUARD` | `off` disables all optional lanes | on |
+| `TOOLCALL_GUARD_AUDIT` | `off` \| `1` \| `overnight` | on (`1`) |
 | `TOOLCALL_GUARD_AUDIT_T` | number (probability cut) | 0.5 / 0.6 by mode |
 | `TOOLCALL_GUARD_RIZZO` | decision-server URL | `http://127.0.0.1:8017/v1/systemone` |
 | `TOOLCALL_GUARD_RIZZO_MODEL` | model id | `rizzo-flow-1.7b-q8_0` |
-| `TOOLCALL_GUARD_PREFLIGHT` | unset \| `1` \| `block` | off |
+| `TOOLCALL_GUARD_PREFLIGHT` | `off` \| `1` \| `block` | on (`1`) |
 | `TOOLCALL_GUARD_CLAMP` / `_CLAMP_MS` | `1` / ms | off / 120000 |
-| `TOOLCALL_GUARD_SCRUB` | unset \| `1` \| `strip` | off |
+| `TOOLCALL_GUARD_SCRUB` | `off` \| `1` \| `strip` | on (`1`) |
 | `TOOLCALL_GUARD_BINARY` | `0` disables the binary-output guard (log path: `TOOLCALL_GUARD_BINARY_LOG`) | on |
 | `TOOLCALL_GUARD_JANITOR` | `0` disables the startup sweep of >1 GB, >24 h tool-output spills | on |
 | `TOOLCALL_GUARD_SCRUB_PROVIDERS` | regex | `qwen\|ds4` |

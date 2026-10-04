@@ -69,3 +69,18 @@ assert.equal(
 }
 
 console.log("turn-audit v4: all assertions passed")
+
+// --- default-on env resolution (subprocess: modes resolve at module load) --
+import { spawnSync } from "node:child_process"
+import { fileURLToPath } from "node:url"
+const MOD = JSON.stringify(fileURLToPath(new URL("../plugins/toolcall-guard.js", import.meta.url)))
+function modes(env) {
+  const probe = `import p from ${MOD}; console.log(JSON.stringify([p.__test.AUDIT_MODE, p.__test.PREFLIGHT_MODE, p.__test.SCRUB_MODE, p.__test.BINARY_ON]))`
+  const r = spawnSync(process.execPath, ["--input-type=module", "-e", probe], { env: { ...process.env, ...env }, encoding: "utf8" })
+  return JSON.parse(r.stdout.trim())
+}
+const base = { TOOLCALL_GUARD: "", TOOLCALL_GUARD_AUDIT: "", TOOLCALL_GUARD_PREFLIGHT: "", TOOLCALL_GUARD_SCRUB: "" }
+assert.deepEqual(modes(base), ["1", "1", "1", true])
+assert.deepEqual(modes({ ...base, TOOLCALL_GUARD: "off" }), ["", "", "", false])
+assert.deepEqual(modes({ ...base, TOOLCALL_GUARD_AUDIT: "overnight", TOOLCALL_GUARD_PREFLIGHT: "block", TOOLCALL_GUARD_SCRUB: "strip" }), ["overnight", "block", "strip", true])
+assert.deepEqual(modes({ ...base, TOOLCALL_GUARD_AUDIT: "off", TOOLCALL_GUARD_PREFLIGHT: "0" }), ["", "", "1", true])
