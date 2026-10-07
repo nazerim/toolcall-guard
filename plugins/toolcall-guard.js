@@ -818,6 +818,61 @@ async function maybeAudit(sessionID, msgs, sessions) {
   log({ stage: "residue", p, probs, fired, why: fired ? "assistant-move" : "ok", ms: Date.now() - t0 })
 }
 
+// Subreport lane: task-tool results whose <task_result> body is empty or
+// provider-clipped. Live case (2026-10-07, ds4): a mistral-large-4 subagent
+// completed 40 min of work and returned an EMPTY task_result three times
+// (original + resume + fresh) before the parent rediscovered the class by
+// hand. Nudging the subagent cannot work: the parent's background.wait
+// resolves at the same loop-end that fires session.idle, so the consumer
+// already left. The right actor is the parent; the right moment is its
+// next model call — which is exactly the outbound copy messages.transform
+// sees. Default: LOG only. TOOLCALL_GUARD_SUBREPORT=annotate additionally
+// appends a fact + resume-with-task-id affordance to the outbound copy
+// (DB untouched, idempotent, never re-logs the same part).
+const SUBREPORT_MODE = (process.env.TOOLCALL_GUARD_SUBREPORT || "").toLowerCase()
+const TASK_BODY_RX = /<task\s+id="(ses_[^"]+)"[^>]*>\s*<task_result>([\s\S]*?)<\/task_result>/
+const subreportSeen = new Set()
+function subreportIssue(text) {
+  if (typeof text !== "string") return null
+  const m = TASK_BODY_RX.exec(text)
+  if (!m) return null
+  const body = (m[2] || "").trim()
+  if (!body) return { task: m[1], kind: "empty-report" }
+  const ck = clipKind(body)
+  if (ck) return { task: m[1], kind: ck === "empty" ? "empty-report" : "clipped-report" }
+  return null
+}
+function annotateSubreports(messages, stats) {
+  if (SUBREPORT_MODE === "off" || SUBREPORT_MODE === "0" || !Array.isArray(messages)) return
+  for (const m of messages) {
+    const parts = Array.isArray(m && m.parts) ? m.parts : []
+    for (const p of parts) {
+      if (!p || p.type !== "tool" || p.tool !== "task") continue
+      const st = p.state
+      if (!st || st.status !== "completed" || typeof st.output !== "string") continue
+      if (st.output.includes("[toolcall-guard subreport")) continue
+      const iss = subreportIssue(st.output)
+      if (!iss) continue
+      const key = (m.info && m.info.id ? m.info.id : "") + ":" + (p.id || iss.task) + ":" + iss.kind
+      if (subreportSeen.has(key)) continue
+      if (subreportSeen.size > 2000) subreportSeen.clear()
+      subreportSeen.add(key)
+      if (stats) stats.subreport = (stats.subreport || 0) + 1
+      try {
+        appendFileSync(
+          process.env.TOOLCALL_GUARD_SUBREPORT_LOG ||
+            join(homedir(), ".local", "share", "opencode", "toolcall-guard.subreport"),
+          JSON.stringify({ at: nowStamp(), kind: iss.kind, task: iss.task, mode: SUBREPORT_MODE || "log", desc: ((st.input && st.input.description) || "").slice(0, 120) }) + "\n",
+        )
+      } catch {}
+      if (SUBREPORT_MODE === "annotate") {
+        st.output +=
+          `\n[toolcall-guard subreport: this ${iss.kind === "empty-report" ? "report is EMPTY — the subagent may have done the work but said nothing; verify the tree state or resume with task=\"" + iss.task + "\" before treating it as complete" : "report was truncated by the provider; resume with task=\"" + iss.task + "\" for the tail"}]`
+      }
+    }
+  }
+}
+
 const ToolCallGuardPlugin = async ({ client }) => {
   const sessions = new Map()
   if (AUDIT_MODE) {
@@ -922,6 +977,7 @@ const ToolCallGuardPlugin = async ({ client }) => {
       try {
         const stats = { n: 0 }
         scrubHistory(output && output.messages, stats)
+        annotateSubreports(output && output.messages, stats)
         const jevItems = confabSyncPass(output && output.messages)
         if (jevItems.length) confabJev(jevItems)
         if (stats.n > 0) {
@@ -983,6 +1039,9 @@ ToolCallGuardPlugin.__test = {
   CONFAB_RULES,
   CONFAB_MARKER,
   binaryGuard,
+  subreportIssue,
+  annotateSubreports,
+  SUBREPORT_MODE,
   AUDIT_MODE,
   PREFLIGHT_MODE,
   SCRUB_MODE,
