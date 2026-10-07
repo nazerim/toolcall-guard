@@ -862,7 +862,7 @@ function annotateSubreports(messages, stats) {
         appendFileSync(
           process.env.TOOLCALL_GUARD_SUBREPORT_LOG ||
             join(homedir(), ".local", "share", "opencode", "toolcall-guard.subreport"),
-          JSON.stringify({ at: nowStamp(), kind: iss.kind, task: iss.task, mode: SUBREPORT_MODE || "log", desc: ((st.input && st.input.description) || "").slice(0, 120) }) + "\n",
+          JSON.stringify({ at: nowStamp(), kind: iss.kind, task: iss.task, mode: SUBREPORT_MODE || "log", model: ((st.metadata && st.metadata.model && (st.metadata.model.modelID || String(st.metadata.model))) || "").slice(0, 60), desc: ((st.input && st.input.description) || "").slice(0, 120) }) + "\n",
         )
       } catch {}
       if (SUBREPORT_MODE === "annotate") {
