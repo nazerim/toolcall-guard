@@ -144,15 +144,44 @@ function handleLine(st, line, emit) {
   emit("data: " + JSON.stringify(ev) + "\n")
 }
 
+// Guard-liveness: the config hook only works if the provider loader honors
+// options.fetch AND provider calls use globalThis.fetch. A runtime rewrite
+// (e.g. OpenCode 2.0's Effect plumbing) could bypass both silently — the
+// guard would become a no-op with zero errors. Cross-check: messages.transform
+// proves a model call happened; guarded fetch proves the guard SAW it. Calls
+// without any interception past a threshold = loud log-only warning.
+const LIVE = { requests: 0, chatReq: 0, streams: 0, wrapped: 0, warned: false }
+const LIVENESS_MIN = 25
+const LIVENESS_LOG = () => process.env.TOOLCALL_GUARD_LIVENESS_LOG || null
+function checkLiveness() {
+  if (LIVE.warned || LIVE.wrapped === 0 || LIVE.requests < LIVENESS_MIN || LIVE.streams > 0) return
+  LIVE.warned = true
+  const line = JSON.stringify({
+    at: nowStamp(),
+    kind: "guard-liveness",
+    err: "guard registered but zero SSE streams intercepted across " + LIVE.requests + " model calls — provider path may bypass options.fetch (runtime rewrite?)",
+    requests: LIVE.requests,
+    chatReq: LIVE.chatReq,
+    wrapped: LIVE.wrapped,
+  })
+  try {
+    const p = LIVENESS_LOG() || join(homedir(), ".local", "share", "opencode", "toolcall-guard.errors")
+    appendFileSync(p, line + "\n")
+  } catch {}
+}
+
 function makeGuard(baseFetch) {
   return async function guardedFetch(input, init) {
     const res = await baseFetch(input, init)
     try {
       const url = typeof input === "string" ? input : (input && input.url) || ""
       const ct = (res.headers && res.headers.get("content-type")) || ""
+      if (url.includes("/chat/completions")) LIVE.chatReq++
       if (!res.ok || !res.body || !url.includes("/chat/completions") || !ct.includes("text/event-stream")) {
+        checkLiveness()
         return res
       }
+      LIVE.streams++
       const st = newState()
       const td = new TextDecoder()
       const te = new TextEncoder()
@@ -977,6 +1006,8 @@ const ToolCallGuardPlugin = async ({ client }) => {
       try {
         const stats = { n: 0 }
         scrubHistory(output && output.messages, stats)
+        LIVE.requests++
+        checkLiveness()
         annotateSubreports(output && output.messages, stats)
         const jevItems = confabSyncPass(output && output.messages)
         if (jevItems.length) confabJev(jevItems)
@@ -1002,6 +1033,7 @@ const ToolCallGuardPlugin = async ({ client }) => {
           p.options.fetch = makeGuard((u, i) => globalThis.fetch(u, i))
           wrapped++
         }
+        LIVE.wrapped = Math.max(LIVE.wrapped, wrapped)
         loadCount++
         try {
           writeFileSync(
@@ -1016,6 +1048,8 @@ const ToolCallGuardPlugin = async ({ client }) => {
 
 ToolCallGuardPlugin.__test = {
   makeGuard,
+  LIVE,
+  checkLiveness,
   handleLine,
   newState,
   cleanName,
