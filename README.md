@@ -141,6 +141,7 @@ Provider-scoped to `qwen|ds4` by default (`TOOLCALL_GUARD_SCRUB_PROVIDERS`).
 | `TOOLCALL_GUARD_SCRUB` | `off` \| `1` \| `strip` | on (`1`) |
 | `TOOLCALL_GUARD_BINARY` | `0` disables the binary-output guard (log path: `TOOLCALL_GUARD_BINARY_LOG`) | on |
 | `TOOLCALL_GUARD_JANITOR` | `0` disables the startup sweep of >1 GB, >24 h tool-output spills | on |
+| `TOOLCALL_GUARD_DANGLING` | `nudge` activates auto-continue on deterministic dangling-announcement stops (colon/em-dash ending + zero tool calls, main sessions, max 2/session); unset = log-only | log |
 | `TOOLCALL_GUARD_LIVENESS_LOG` | redirect the guard-liveness warning (default: `toolcall-guard.errors`) | unset |
 | `TOOLCALL_GUARD_SUBREPORT` | `off` \| log-only (unset) \| `annotate` (append fact + resume-with-task-id hint to empty/clipped subagent reports in the outbound copy) | log |
 | `TOOLCALL_GUARD_SCRUB_PROVIDERS` | regex | `qwen\|ds4` |

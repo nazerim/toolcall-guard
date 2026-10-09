@@ -339,6 +339,17 @@ const NUDGE = (tail) =>
   JSON.stringify(tail) +
   "). Resume exactly where you stopped — do not repeat what you already said, and never emit raw ChatML control tokens; refer to them in spaced form."
 
+// Dangling-announcement nudge (deterministic lane): sieve stage "dangling" =
+// announced action + colon/em-dash/comma ending, zero tool calls. Live base
+// rate Oct-9: 2/2 operator-confirmed true positives (ds4 "Banking now —
+// commit + push:" x2, user manually supplied the nudge). Default log-only;
+// TOOLCALL_GUARD_DANGLING=nudge activates. Facts only; subagents never nudged.
+const DANGLING_MODE = (process.env.TOOLCALL_GUARD_DANGLING || "").toLowerCase()
+const DANGLING_NUDGE = (tail) =>
+  "[toolcall-guard auto-continue] Your previous reply ended mid-announcement (it ended: " +
+  JSON.stringify((tail || "").slice(-160)) +
+  ") and the turn made no tool call. If the announced action is still intended, perform it now with tool calls; otherwise state the next move explicitly."
+
 // --- turn-audit: incomplete-turn observation lane (v3: sieve + whose-move) --
 // Same session.idle seam, runs when the clip heuristic found nothing.
 // Deterministic sieve first (question/offer endings exit free — 55/55 of the
@@ -443,6 +454,7 @@ function analyzeAudit(msgs) {
     toolCount += (msgs[i].parts || []).filter((p) => p && p.type === "tool").length
   return {
     messageID: info.id,
+    agent: info.agent || undefined,
     request: request.slice(0, 1200),
     tail: text.slice(-800),
     toolCount,
@@ -789,8 +801,8 @@ function binaryGuard(input, output) {
   return true
 }
 
-async function maybeAudit(sessionID, msgs, sessions) {
-  if (!AUDIT_MODE || !RIZZO_LIVE) return
+async function maybeAudit(sessionID, msgs, sessions, isSub, client) {
+  if (!AUDIT_MODE) return
   const a = analyzeAudit(msgs)
   if (!a) return
   let st = sessions.get(sessionID)
@@ -815,9 +827,38 @@ async function maybeAudit(sessionID, msgs, sessions) {
     return
   }
   if (stage === "dangling") {
-    log({ stage, fired: true, why: "dangling-rule" })
+    let nudged = false
+    if (DANGLING_MODE === "nudge" && !isSub && a.toolCount === 0 && client) {
+      st.dnudged = st.dnudged || new Set()
+      st.dnudgeCount = st.dnudgeCount || 0
+      if (!st.dnudged.has(a.messageID) && st.dnudgeCount < 2) {
+        st.dnudged.add(a.messageID)
+        st.dnudgeCount++
+        nudged = true
+        try {
+          await client.session.prompt({
+            path: { id: sessionID },
+            body: {
+              ...(a.agent ? { agent: a.agent } : {}),
+              ...(a.model ? { model: a.model } : {}),
+              parts: [{ type: "text", text: DANGLING_NUDGE(a.tail) }],
+            },
+          })
+        } catch {
+          nudged = false
+        }
+        try {
+          appendFileSync(
+            join(homedir(), ".local", "share", "opencode", "toolcall-guard.clips"),
+            JSON.stringify({ at: nowStamp(), sessionID, messageID: a.messageID, kind: "dangling-nudge" }) + "\n",
+          )
+        } catch {}
+      }
+    }
+    log({ stage, fired: true, why: "dangling-rule", nudged })
     return
   }
+  if (!RIZZO_LIVE) return
   if (st.audited.has(a.messageID) || st.auditCount >= 15) return
   const t0 = Date.now()
   let p
@@ -942,12 +983,12 @@ const ToolCallGuardPlugin = async ({ client }) => {
           // Subagents: observation only, always. Nudging a subagent would
           // fight the orchestrator; auditing their final turns is the
           // richest stop data we have (handoff queues, flat closes).
-          await maybeAudit(sessionID, msgs, sessions)
+          await maybeAudit(sessionID, msgs, sessions, true, client)
           return
         }
         const a = analyzeMessages(msgs)
         if (!a) {
-          await maybeAudit(sessionID, msgs, sessions)
+          await maybeAudit(sessionID, msgs, sessions, false, client)
           return
         }
         let st = sessions.get(sessionID)
@@ -1063,6 +1104,8 @@ ToolCallGuardPlugin.__test = {
   analyzeAudit,
   auditBody,
   sieveStage,
+  DANGLING_NUDGE,
+  maybeAudit,
   AUDIT_Q,
   preflightPattern,
   binaryPeek,
