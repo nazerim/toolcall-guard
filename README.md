@@ -50,6 +50,8 @@ affected. See each lane's privacy note.
 
 ## Install
 
+**V1 (opencode 1.x):**
+
 ```bash
 mkdir -p ~/.config/opencode/plugins
 cp plugins/toolcall-guard.js ~/.config/opencode/plugins/
@@ -57,6 +59,54 @@ cp plugins/toolcall-guard.js ~/.config/opencode/plugins/
 
 (or drop it in a project's `.opencode/plugins/`). **Restart opencode** —
 config and plugins load once at startup.
+
+**V2 (opencode 2.x):** V2 loads plugin **package directories**, not bare
+files — point the `plugins` config array at this repo's `plugin-v2/`
+directory (absolute path, e.g. in the global `opencode.json`):
+
+```jsonc
+{ "plugins": ["/path/to/toolcall-guard/plugin-v2"] }
+```
+
+## OpenCode 2 (V2) support
+
+Same core file, two entry shapes — because the runtimes are asymmetric and
+both asymmetries were proven live (2026-10-22, opencode 2.1.2 vs 1.19.3):
+
+- **V1 loads only a FUNCTION default export** (`plugins/toolcall-guard.js` —
+  the documented 1.18.29+ object entry does NOT load in 1.19.3: the guarded
+  crash resurfaces with zero plugin logs).
+- **V2 loads only an OBJECT default export** with `{ id, setup }` — the
+  function is skipped silently. `plugin-v2/index.js` is the V2 package
+  directory; it builds the object from the core's `setup` property. No
+  `@opencode/plugin` dependency needed.
+
+V2 layers ported (env flags shared with V1):
+
+| V1 hook | V2 destination |
+|---|---|
+| `config` (wrap each openai-compatible provider's `options.fetch`) | `ctx.session.hook("http.response")` — replaces `event.response` with the piped body; gated on SSE content-type only (the provider catalog is incomplete at plugin-boot, so an allowlist there races — and `handleLine` passes non-OpenAI lines byte-identical anyway) |
+| `experimental.chat.messages.transform` | `ctx.session.hook("context"/"compaction"/"generate"/"title")` + `scrubStrings` (shape-agnostic deep walk covers V2 text/reasoning/tool-arg parts) |
+| `event` on `session.idle` | `ctx.event.subscribe()` on **`session.execution.succeeded`** — V2's public stream does NOT emit `session.idle` (V1-compat only); message shape via `ctx.session.context()` (`{data:[…]}` envelope; `finish` presence replaces the step-finish-part abort check) |
+
+Not yet ported to V2 (V1 keeps them): pre-flight, binary guard, subreport
+annotation, JEV confab, turn audit, janitor.
+
+V2 marker/log files land in `$XDG_DATA_HOME/opencode/` (the V1 default when
+unset) — the `DATA_DIR()` helper keeps one file correct for both installs.
+
+V2 quirks found while verifying (fixture + harness handle all of them):
+
+- The V2 **title request embeds the raw user prompt** — any server-side
+  "is this the main turn?" heuristic must key on something else (the
+  fixture uses the presence of `tools`).
+- `opencode run --standalone "<msg>"` stores the message **with literal
+  quotes** around it.
+- `ctx.provider.list()` / `ctx.session.context()` answer with a
+  `{location, data}` / `{data}` envelope; provider.list() may also reject
+  while the registry boots.
+- The bash tool is named **`shell`** in V2 — the fixture auto-detects which
+  name the harness offers.
 
 Applies automatically to every provider whose `npm` is
 `@ai-sdk/openai-compatible`. Verify via marker files:
@@ -151,21 +201,22 @@ Privacy: the audit and scrub lanes send turn text (request + reply tail /
 passage) to the configured URL — localhost by default, never remote unless
 you point it there. Preflight logs command snippets; the confab log may
 contain quoted reasoning snippets. All logs live under
-`~/.local/share/opencode/toolcall-guard.*` (`audit`, `audit.shadow`,
+`~/.local/share/opencode/toolcall-guard.*` (or `$XDG_DATA_HOME/opencode/`
+when set — the V2 install) (`audit`, `audit.shadow`,
 `preflight`, `confab`, `clips`, `scrubbed`, `idles`, `errors`, `loaded`, `binary`, `janitor`).
 
 ## Tests
 
 ```bash
-node test/toolcall-guard.test.mjs        # 14 fixtures: guard, scrubber, detector
-node test/turn-audit.test.mjs            # sieve + audit-state + wire shape
-node test/preflight.test.mjs             # argv danger parsing (17 cases)
-node test/confab.test.mjs                # rules, tiers, never-empty guard
+for t in test/*.test.mjs; do node $t; done   # unit suites, incl. test/v2.test.mjs
+                                              # (entry shapes, analyzeMessagesV2,
+                                              #  guardSseResponse, deep scrub)
 ```
 
 End-to-end against a synthetic malformed SSE server (no real API needed):
 
 ```bash
+# V1
 SCENARIO=late PORT=8787 node test/toolcall-guard-server.mjs &
 OPENCODE_CONFIG=$PWD/test/toolcall-guard-test.opencode.json \
   opencode run --auto -m guardtest/guardtest-model "say hi MARKER7788"
@@ -177,6 +228,19 @@ OPENCODE_CONFIG=$PWD/test/toolcall-guard-test.opencode.json \
 - `SCENARIO=poison` → token in history scrubbed from the replayed request
 - `SCENARIO=clip` → clipped turn auto-nudged and resumed (use `opencode serve`
   + HTTP API so the nudge isn't raced by `run` exiting)
+
+**V2** — one script per harness (isolated XDG triple + standalone server;
+requires `OPENCODE_V2_BIN` if opencode 2 is not at the default path):
+
+```bash
+zsh test/e2e-v2-matrix.sh        # late/drop/poison/clip via run --standalone
+zsh test/e2e-v2-clip-serve.sh    # clip nudge round-trip on a persistent serve
+```
+
+The V2 fixture config (`test/toolcall-guard-test.v2.opencode.json`) is the
+`plugins`-array twin of the V1 test config. The fixture auto-detects the
+harness generation (tools → V2 `shell` vs V1 `bash`) and excludes the V2
+title request from scenario serving — see the V2 support section.
 
 The server fixture builds token strings by concatenation — the repo itself
 stays parser-inert, because these files were authored *through* the failing

@@ -1,6 +1,9 @@
 import assert from "node:assert/strict"
 import { mkdirSync, readFileSync, rmSync, existsSync } from "node:fs"
 process.env.HOME = "/tmp/tcg-dangling-home"
+// DATA_DIR honors XDG_DATA_HOME per spec — pin it to the sandbox so a shell
+// export (e.g. the V2 wrapper's) cannot leak writes into a real data dir.
+process.env.XDG_DATA_HOME = process.env.HOME + "/.local/share"
 process.env.TOOLCALL_GUARD_AUDIT = "1"
 process.env.TOOLCALL_GUARD_DANGLING = "nudge"
 mkdirSync(process.env.HOME + "/.local/share/opencode", { recursive: true })

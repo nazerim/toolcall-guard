@@ -27,6 +27,12 @@ import { appendFileSync, writeFileSync, readdirSync, statSync, unlinkSync } from
 import { homedir } from "node:os"
 import { join } from "node:path"
 
+// State/log dir. XDG_DATA_HOME wins when set (V2 wrapper exports
+// ~/.opencode2/data → markers land in the v2 data dir; default unset → V1's
+// ~/.local/share/opencode). Tests that sandbox HOME must also pin
+// XDG_DATA_HOME (see test/*.mjs) — XDG takes precedence per spec.
+const DATA_DIR = () => join(process.env.XDG_DATA_HOME || join(homedir(), ".local", "share"), "opencode")
+
 const cleanName = (v) => (typeof v === "string" ? v.replace(/^[\s`]+|[\s`]+$/g, "") : "")
 
 // Local ISO stamp WITH offset (operator lives in UTC+8; bare toISOString()
@@ -165,9 +171,50 @@ function checkLiveness() {
     wrapped: LIVE.wrapped,
   })
   try {
-    const p = LIVENESS_LOG() || join(homedir(), ".local", "share", "opencode", "toolcall-guard.errors")
+    const p = LIVENESS_LOG() || join(DATA_DIR(), "toolcall-guard.errors")
     appendFileSync(p, line + "\n")
   } catch {}
+}
+
+// SSE interception core: pipe one streaming chat-completions response through
+// the line state machine; anything not ok/SSE passes through untouched
+// (returned as-is with guarded=false so callers can keep their liveness math).
+function guardSseResponse(res) {
+  try {
+    if (!res || !res.ok || !res.body) return { res, guarded: false }
+    const ct = (res.headers && res.headers.get("content-type")) || ""
+    if (!ct.includes("text/event-stream")) return { res, guarded: false }
+    LIVE.streams++
+    const st = newState()
+    const td = new TextDecoder()
+    const te = new TextEncoder()
+    const guarded = res.body.pipeThrough(
+      new TransformStream({
+        transform(bytes, controller) {
+          const emit = (s) => controller.enqueue(te.encode(s))
+          st.line += td.decode(bytes, { stream: true })
+          let cut = st.line.indexOf("\n")
+          while (cut >= 0) {
+            const line = st.line.slice(0, cut)
+            st.line = st.line.slice(cut + 1)
+            handleLine(st, line, emit)
+            cut = st.line.indexOf("\n")
+          }
+        },
+        flush(controller) {
+          const emit = (s) => controller.enqueue(te.encode(s))
+          st.line += td.decode()
+          if (st.line !== "") {
+            for (const p of st.line.split("\n")) handleLine(st, p, emit)
+            st.line = ""
+          }
+        },
+      }),
+    )
+    return { res: new Response(guarded, { status: res.status, statusText: res.statusText, headers: res.headers }), guarded: true }
+  } catch {
+    return { res, guarded: false }
+  }
 }
 
 function makeGuard(baseFetch) {
@@ -175,44 +222,14 @@ function makeGuard(baseFetch) {
     const res = await baseFetch(input, init)
     try {
       const url = typeof input === "string" ? input : (input && input.url) || ""
-      const ct = (res.headers && res.headers.get("content-type")) || ""
       if (url.includes("/chat/completions")) LIVE.chatReq++
-      if (!res.ok || !res.body || !url.includes("/chat/completions") || !ct.includes("text/event-stream")) {
+      if (!url.includes("/chat/completions")) {
         checkLiveness()
         return res
       }
-      LIVE.streams++
-      const st = newState()
-      const td = new TextDecoder()
-      const te = new TextEncoder()
-      const guarded = res.body.pipeThrough(
-        new TransformStream({
-          transform(bytes, controller) {
-            const emit = (s) => controller.enqueue(te.encode(s))
-            st.line += td.decode(bytes, { stream: true })
-            let cut = st.line.indexOf("\n")
-            while (cut >= 0) {
-              const line = st.line.slice(0, cut)
-              st.line = st.line.slice(cut + 1)
-              handleLine(st, line, emit)
-              cut = st.line.indexOf("\n")
-            }
-          },
-          flush(controller) {
-            const emit = (s) => controller.enqueue(te.encode(s))
-            st.line += td.decode()
-            if (st.line !== "") {
-              for (const p of st.line.split("\n")) handleLine(st, p, emit)
-              st.line = ""
-            }
-          },
-        }),
-      )
-      return new Response(guarded, {
-        status: res.status,
-        statusText: res.statusText,
-        headers: res.headers,
-      })
+      const g = guardSseResponse(res)
+      if (!g.guarded) checkLiveness()
+      return g.res
     } catch {
       return res
     }
@@ -526,7 +543,7 @@ const CONFAB_MARKER = "[toolcall-guard: confabulated narration removed from outg
 function confabLog(rec) {
   try {
     appendFileSync(
-      process.env.TOOLCALL_GUARD_CONFAB_LOG || join(homedir(), ".local", "share", "opencode", "toolcall-guard.confab"),
+      process.env.TOOLCALL_GUARD_CONFAB_LOG || join(DATA_DIR(), "toolcall-guard.confab"),
       JSON.stringify(Object.assign({ at: nowStamp(), id: process.pid + "-" + ++scrubSeq }, rec)) + "\n",
     )
   } catch {}
@@ -726,7 +743,7 @@ async function maybePreflight(input, output) {
   if (hit || peek) {
     try {
       appendFileSync(
-        join(homedir(), ".local", "share", "opencode", "toolcall-guard.preflight"),
+        join(DATA_DIR(), "toolcall-guard.preflight"),
         JSON.stringify({ at: nowStamp(), kind: hit ? "pattern" : "binary-peek", name: hit || peek, mode: PREFLIGHT_MODE, cmd: cmd.slice(0, 200) }) + "\n",
       )
     } catch {}
@@ -742,7 +759,7 @@ async function maybePreflight(input, output) {
     output.args.timeout = CLAMP_MS
     try {
       appendFileSync(
-        join(homedir(), ".local", "share", "opencode", "toolcall-guard.preflight"),
+        join(DATA_DIR(), "toolcall-guard.preflight"),
         JSON.stringify({ at: nowStamp(), kind: "clamp", ms: CLAMP_MS, cmd: cmd.slice(0, 200) }) + "\n",
       )
     } catch {}
@@ -755,7 +772,7 @@ function preflightAfter(input, output) {
   if (out.length > 50000) {
     try {
       appendFileSync(
-        join(homedir(), ".local", "share", "opencode", "toolcall-guard.preflight"),
+        join(DATA_DIR(), "toolcall-guard.preflight"),
         JSON.stringify({ at: nowStamp(), kind: "giant-output", bytes: out.length, cmd: ((input.args && input.args.command) || "").slice(0, 200) }) + "\n",
       )
     } catch {}
@@ -794,7 +811,7 @@ function binaryGuard(input, output) {
   try {
     appendFileSync(
       process.env.TOOLCALL_GUARD_BINARY_LOG ||
-        join(homedir(), ".local", "share", "opencode", "toolcall-guard.binary"),
+        join(DATA_DIR(), "toolcall-guard.binary"),
       JSON.stringify({ at: nowStamp(), sessionID: input.sessionID, tool: input.tool, bytes: out.length, ctrl, cmd }) + "\n",
     )
   } catch {}
@@ -816,7 +833,7 @@ async function maybeAudit(sessionID, msgs, sessions, isSub, client) {
   const log = (rec) => {
     try {
       appendFileSync(
-        join(homedir(), ".local", "share", "opencode", "toolcall-guard.audit"),
+        join(DATA_DIR(), "toolcall-guard.audit"),
         JSON.stringify(Object.assign({ v: 3, at: nowStamp(), sessionID, messageID: a.messageID, lane, toolCount: a.toolCount }, rec)) + "\n",
       )
     } catch {}
@@ -849,7 +866,7 @@ async function maybeAudit(sessionID, msgs, sessions, isSub, client) {
         }
         try {
           appendFileSync(
-            join(homedir(), ".local", "share", "opencode", "toolcall-guard.clips"),
+            join(DATA_DIR(), "toolcall-guard.clips"),
             JSON.stringify({ at: nowStamp(), sessionID, messageID: a.messageID, kind: "dangling-nudge" }) + "\n",
           )
         } catch {}
@@ -931,7 +948,7 @@ function annotateSubreports(messages, stats) {
       try {
         appendFileSync(
           process.env.TOOLCALL_GUARD_SUBREPORT_LOG ||
-            join(homedir(), ".local", "share", "opencode", "toolcall-guard.subreport"),
+            join(DATA_DIR(), "toolcall-guard.subreport"),
           JSON.stringify({ at: nowStamp(), kind: iss.kind, task: iss.task, mode: SUBREPORT_MODE || "log", model: ((st.metadata && st.metadata.model && (st.metadata.model.modelID || String(st.metadata.model))) || "").slice(0, 60), desc: ((st.input && st.input.description) || "").slice(0, 120) }) + "\n",
         )
       } catch {}
@@ -951,11 +968,11 @@ const ToolCallGuardPlugin = async ({ client }) => {
     if (t.unref) t.unref()
   }
   if (JANITOR_ON) {
-    const r = janitorSweep(join(homedir(), ".local", "share", "opencode", "tool-output"))
+    const r = janitorSweep(join(DATA_DIR(), "tool-output"))
     if (r.deleted > 0) {
       try {
         appendFileSync(
-          join(homedir(), ".local", "share", "opencode", "toolcall-guard.janitor"),
+          join(DATA_DIR(), "toolcall-guard.janitor"),
           JSON.stringify({ at: nowStamp(), deleted: r.deleted, bytes: r.bytes }) + "\n",
         )
       } catch {}
@@ -970,7 +987,7 @@ const ToolCallGuardPlugin = async ({ client }) => {
         if (!AUDIT_MODE && !PREFLIGHT_MODE && !SCRUB_MODE) return
         try {
           appendFileSync(
-            join(homedir(), ".local", "share", "opencode", "toolcall-guard.idles"),
+            join(DATA_DIR(), "toolcall-guard.idles"),
             JSON.stringify({ at: nowStamp(), sessionID }) + "\n",
           )
         } catch {}
@@ -1009,14 +1026,14 @@ const ToolCallGuardPlugin = async ({ client }) => {
         })
         try {
           appendFileSync(
-            join(homedir(), ".local", "share", "opencode", "toolcall-guard.clips"),
+            join(DATA_DIR(), "toolcall-guard.clips"),
             JSON.stringify({ at: nowStamp(), sessionID, messageID: a.messageID, kind: a.kind }) + "\n",
           )
         } catch {}
       } catch (e) {
         try {
           appendFileSync(
-            join(homedir(), ".local", "share", "opencode", "toolcall-guard.errors"),
+            join(DATA_DIR(), "toolcall-guard.errors"),
             JSON.stringify({ at: nowStamp(), err: String((e && e.message) || e).slice(0, 300) }) + "\n",
           )
         } catch {}
@@ -1029,7 +1046,7 @@ const ToolCallGuardPlugin = async ({ client }) => {
         if (String((e && e.message) || "").startsWith("[toolcall-guard pre-flight]")) throw e
         try {
           appendFileSync(
-            join(homedir(), ".local", "share", "opencode", "toolcall-guard.errors"),
+            join(DATA_DIR(), "toolcall-guard.errors"),
             JSON.stringify({ at: nowStamp(), lane: "preflight", err: String((e && e.message) || e).slice(0, 300) }) + "\n",
           )
         } catch {}
@@ -1055,7 +1072,7 @@ const ToolCallGuardPlugin = async ({ client }) => {
         if (stats.n > 0) {
           try {
             appendFileSync(
-              join(homedir(), ".local", "share", "opencode", "toolcall-guard.scrubbed"),
+              join(DATA_DIR(), "toolcall-guard.scrubbed"),
               JSON.stringify({ at: nowStamp(), rewrites: stats.n }) + "\n",
             )
           } catch {}
@@ -1078,7 +1095,7 @@ const ToolCallGuardPlugin = async ({ client }) => {
         loadCount++
         try {
           writeFileSync(
-            join(homedir(), ".local", "share", "opencode", "toolcall-guard.loaded"),
+            join(DATA_DIR(), "toolcall-guard.loaded"),
             JSON.stringify({ at: nowStamp(), configHookRuns: loadCount, providersWrapped: wrapped }) + "\n",
           )
         } catch {}
@@ -1096,6 +1113,7 @@ ToolCallGuardPlugin.__test = {
   cleanName,
   processToolCalls,
   scrub,
+  scrubStrings,
   scrubHistory,
   SEP_TOKEN,
   clipKind,
@@ -1123,6 +1141,197 @@ ToolCallGuardPlugin.__test = {
   PREFLIGHT_MODE,
   SCRUB_MODE,
   BINARY_ON,
+}
+
+// --- V2 entrypoint adapter (OpenCode 2 plugin API) -------------------------
+// One core, two runtimes: V1 default-exports this function (full stack);
+// V2 loads plugin-v2/index.js, which wraps the { id, setup } object below.
+// V2 reads { id, setup } and runs ONLY the core layers ported here:
+//   1. SSE guard    — ctx.session.hook("http.response") replaces the V1
+//      config-hook fetch wrapping; same guardSseResponse core.
+//   2. Scrubber     — ctx.session.hook("context"/"compaction"/"generate"/
+//      "title") deep-scrubs event.messages (scrubStrings is shape-agnostic,
+//      so it covers text/reasoning/tool args on the V2 wire format).
+//   3. Auto-continue— ctx.event.subscribe() on session.execution.succeeded
+//      (V2's turn-complete event; session.idle is V1-compat and NOT emitted
+//      on the V2 stream); V2 message-shape adapter analyzeMessagesV2; nudge
+//      via ctx.session.prompt.
+// NOT yet ported to V2 (V1 keeps them): pre-flight, binary guard, subreport
+// annotation, JEV confab, turn audit, janitor.
+const analyzeMessagesV2 = (raw) => {
+  // ctx.session.context() answers with a {data:[...]} envelope — unwrap.
+  const msgs = Array.isArray(raw) ? raw : (raw && Array.isArray(raw.data) ? raw.data : [])
+  let last = null
+  for (let i = (msgs || []).length - 1; i >= 0; i--) {
+    const m = msgs[i]
+    if (m && m.type === "assistant") {
+      last = m
+      break
+    }
+  }
+  if (!last) return null
+  if (last.error) return null
+  const content = Array.isArray(last.content) ? last.content : []
+  // finish is written inline with the stream; its absence is the race-free
+  // abort signal (same reasoning as the V1 step-finish-part check).
+  if (!last.finish) return null
+  if (["title", "summary", "compaction"].includes(last.agent)) return null
+  if (content.some((c) => c && c.type === "tool")) return null
+  const text = content
+    .filter((c) => c && c.type === "text")
+    .map((c) => c.text || "")
+    .join("")
+  const kind = clipKind(text)
+  if (!kind) return null
+  return { messageID: last.id, kind, tail: text.trim().slice(-40) }
+}
+
+const toolCallGuardV2Setup = async (ctx) => {
+  if (MASTER_OFF) return
+  const logFile = (name, obj) => {
+    try {
+      appendFileSync(join(DATA_DIR(), name), JSON.stringify({ at: nowStamp(), ...obj }) + "\n")
+    } catch {}
+  }
+  // openai-compatible provider allowlist (mirrors the V1 config-hook filter).
+  // ctx.provider.list() can reject while the registry is still booting, so
+  // resolution is lazy + non-fatal: gate stays OPEN until resolved and only
+  // then filters; the SSE content-type check is always the safety net.
+  const openaiSet = new Set()
+  let providersResolved = false
+  const resolveProviders = async () => {
+    if (providersResolved) return
+    try {
+      const raw = await ctx.provider.list()
+      providersResolved = true
+      const list = Array.isArray(raw) ? raw : (raw && Array.isArray(raw.data) ? raw.data : [])
+      const probe = (process.env.TOOLCALL_GUARD_V2_DEBUG || "").toLowerCase()
+      if (probe === "dump") {
+        try {
+          writeFileSync(join(DATA_DIR(), "toolcall-guard.provider-dump.json"), JSON.stringify(list, null, 1))
+        } catch {}
+      }
+      for (const p of list) {
+        const info = (p && p.info) || p || {}
+        const pkg = String(info.package || info.npm || "")
+        const pid = (p && p.id) || info.id
+        if (pid && pkg.includes("openai-compatible")) openaiSet.add(String(pid))
+      }
+      LIVE.wrapped = Math.max(LIVE.wrapped, openaiSet.size)
+      try {
+        writeFileSync(
+          join(DATA_DIR(), "toolcall-guard.loaded"),
+          JSON.stringify({ at: nowStamp(), entry: "v2", providersWrapped: openaiSet.size }) + "\n",
+        )
+      } catch {}
+    } catch {}
+  }
+  void resolveProviders()
+
+  // 1) SSE guard on native provider HTTP responses. Gated on content-type
+  // only (guardSseResponse): provider.list() is incomplete while custom
+  // providers activate, so an allowlist here would race — and is unnecessary,
+  // handleLine passes non-OpenAI-shaped SSE lines through byte-identical.
+  await ctx.session.hook("http.response", (event) => {
+    try {
+      LIVE.requests++
+      const g = guardSseResponse(event.response)
+      event.response = g.res
+      if (!g.guarded) checkLiveness()
+    } catch {}
+  })
+
+  // 2) outbound-history scrub on every model-request kind (V1's single
+  // messages.transform covered all of them via the shared fetch path)
+  if (SCRUB_MODE) {
+    const scrubPass = (event) => {
+      try {
+        const stats = { n: 0 }
+        scrubStrings(event.messages, stats)
+        if (stats.n > 0) logFile("toolcall-guard.scrubbed", { rewrites: stats.n })
+      } catch {}
+    }
+    for (const kind of ["context", "compaction", "generate", "title"]) {
+      try {
+        await ctx.session.hook(kind, scrubPass)
+      } catch {}
+    }
+  }
+
+  // 3) auto-continue on session.idle (clipKind heuristic; once per assistant
+  // message, max 3 per session, subagent sessions and aborted turns skipped)
+  const sessions = new Map()
+  const controller = new AbortController()
+  const evProbe = (process.env.TOOLCALL_GUARD_V2_DEBUG || "").toLowerCase() === "events"
+  let evSeen = 0
+  void (async () => {
+    try {
+      for await (const ev of ctx.event.subscribe({ signal: controller.signal })) {
+        if (evProbe && evSeen++ < 60) {
+          try {
+            appendFileSync(
+              join(DATA_DIR(), "toolcall-guard.events"),
+              JSON.stringify({ at: nowStamp(), keys: Object.keys(ev || {}), type: ev && ev.type, event: ev && ev.event, dataKeys: Object.keys((ev && ev.data) || {}) }) + "\n",
+            )
+          } catch {}
+        }
+        try {
+          // V2 public stream: turn completion is session.execution.succeeded
+          // (the migration-guide example's session.idle is V1-compat and is
+          // NOT emitted on the V2 stream — verified live on 2.1.2).
+          const isIdle = ev && (ev.type === "session.execution.succeeded" || ev.type === "session.idle")
+          if (!isIdle) continue
+          const d = (ev && ev.data) || {}
+          const sessionID = (d && d.sessionID) || (d && d.id) || (ev && ev.sessionID) || (ev.properties && ev.properties.sessionID)
+          if (!sessionID) continue
+          logFile("toolcall-guard.idles", { sessionID })
+          const sess = await ctx.session.get({ sessionID })
+          const info = sess && sess.data ? sess.data : sess
+          if (info && info.parentID) continue
+          const msgs = await ctx.session.context({ sessionID })
+          const a = analyzeMessagesV2(msgs)
+          if (!a) continue
+          let st = sessions.get(sessionID)
+          if (!st) {
+            st = { nudged: new Set(), count: 0 }
+            sessions.set(sessionID, st)
+          }
+          if (st.nudged.has(a.messageID) || st.count >= 3) continue
+          st.nudged.add(a.messageID)
+          st.count++
+          await ctx.session.prompt({ sessionID, text: NUDGE(a.tail) })
+          logFile("toolcall-guard.clips", { sessionID, messageID: a.messageID, kind: a.kind })
+        } catch (e) {
+          logFile("toolcall-guard.errors", { lane: "v2-events", err: String((e && e.message) || e).slice(0, 300) })
+        }
+      }
+    } catch (e) {
+      logFile("toolcall-guard.errors", { lane: "v2-subscribe", err: String((e && e.message) || e).slice(0, 300) })
+    }
+  })()
+
+  try {
+    writeFileSync(
+      join(DATA_DIR(), "toolcall-guard.loaded"),
+      JSON.stringify({ at: nowStamp(), entry: "v2", providersWrapped: openaiSet.size }) + "\n",
+    )
+  } catch {}
+
+  return () => controller.abort()
+}
+
+// Default export stays the V1 FUNCTION: v1.19.3 does NOT load object entries
+// (proven live 2026-10-22 — null-name crash resurfaced, zero plugin logs)
+// and v2 does NOT load function entries (no marker). V2 loads the object
+// built from these properties by plugin-v2/index.js.
+ToolCallGuardPlugin.id = "toolcall-guard"
+ToolCallGuardPlugin.setup = toolCallGuardV2Setup
+ToolCallGuardPlugin.__test = {
+  ...ToolCallGuardPlugin.__test,
+  DATA_DIR,
+  guardSseResponse,
+  analyzeMessagesV2,
+  toolCallGuardV2Setup,
 }
 
 export default ToolCallGuardPlugin

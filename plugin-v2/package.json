@@ -1,0 +1,9 @@
+{
+  "name": "toolcall-guard",
+  "version": "0.0.0-local",
+  "description": "Local v2 package entry for the toolcall-guard dual-entry plugin (repo root is the V1 plugin; this dir is the V2 plugin path — V2 plugin config entries must be directories).",
+  "type": "module",
+  "exports": {
+    ".": "./index.js"
+  }
+}

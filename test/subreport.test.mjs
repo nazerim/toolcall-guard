@@ -1,3 +1,5 @@
+import { mkdirSync as _mk } from "node:fs"
+process.env.XDG_DATA_HOME = "/tmp/tcg-test-home"; _mk(process.env.XDG_DATA_HOME + "/opencode", { recursive: true }) // hermetic: never leak markers into a real data dir
 import assert from "node:assert/strict"
 import { spawnSync } from "node:child_process"
 import { fileURLToPath } from "node:url"
