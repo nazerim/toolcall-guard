@@ -87,7 +87,7 @@ V2 layers ported (env flags shared with V1):
 |---|---|
 | `config` (wrap each openai-compatible provider's `options.fetch`) | `ctx.session.hook("http.response")` — replaces `event.response` with the piped body; gated on SSE content-type only (the provider catalog is incomplete at plugin-boot, so an allowlist there races — and `handleLine` passes non-OpenAI lines byte-identical anyway) |
 | `experimental.chat.messages.transform` | `ctx.session.hook("context"/"compaction"/"generate"/"title")` + `scrubStrings` (shape-agnostic deep walk covers V2 text/reasoning/tool-arg parts) |
-| `event` on `session.idle` | `ctx.event.subscribe()` on **`session.execution.succeeded`** — V2's public stream does NOT emit `session.idle` (V1-compat only); message shape via `ctx.session.context()` (`{data:[…]}` envelope; `finish` presence replaces the step-finish-part abort check) |
+| `event` on `session.idle` | `ctx.event.subscribe()` on **`session.execution.succeeded`** — V2's turn-complete event. The shared V2 service runs plugin setup once PER LOCATION and may also deliver the V1-compat `session.idle` per turn, so one event can reach several instances: nudges are guarded by an exclusive-create claim file per message (`toolcall-guard.nudge.<messageID>`), making double delivery a functional no-op (only the `idles` log doubles). Message shape via `ctx.session.context()` (`{data:[…]}` envelope; `finish` presence replaces the step-finish-part abort check) |
 
 Not yet ported to V2 (V1 keeps them): pre-flight, binary guard, subreport
 annotation, JEV confab, turn audit, janitor.
@@ -211,7 +211,10 @@ you point it there. Preflight logs command snippets; the confab log may
 contain quoted reasoning snippets. All logs live under
 `~/.local/share/opencode/toolcall-guard.*` (or `$XDG_DATA_HOME/opencode/`
 when set — the V2 install) (`audit`, `audit.shadow`,
-`preflight`, `confab`, `clips`, `scrubbed`, `idles`, `errors`, `loaded`, `binary`, `janitor`).
+`preflight`, `confab`, `clips`, `scrubbed`, `idles`, `errors`, `loaded`, `binary`, `janitor`,
+plus `nudge.<messageID>` / `nudge.dangling.<messageID>` claim files (exclusive-create tokens
+guarantee one nudge per message across all plugin instances — the V2 service runs setup once
+per location and every instance sees every shared-stream event).
 
 ## Tests
 

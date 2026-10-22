@@ -361,6 +361,23 @@ const NUDGE = (tail) =>
   JSON.stringify(tail) +
   "). Resume exactly where you stopped — do not repeat what you already said, and never emit raw ChatML control tokens; refer to them in spaced form."
 
+// Cross-instance nudge claim. The v2 service runs plugin setup once PER
+// LOCATION (observed 2026-10-22: repeated "loading plugin" pairs in one
+// server process), and every instance sees every event on the shared
+// stream — per-instance nudged-sets cannot prevent a double nudge. Claim
+// the message with an exclusive-create file before prompting; the loser
+// skips. Fails OPEN on fs errors (a nudge beats silence). Claim files are
+// tiny and rare (max 3/session); the janitor's tool-output sweep leaves
+// them, they are pruned by messageID uniqueness naturally.
+const claimNudge = (messageID) => {
+  try {
+    appendFileSync(join(DATA_DIR(), "toolcall-guard.nudge." + messageID), "", { flag: "wx" })
+    return true
+  } catch (e) {
+    return !(e && e.code === "EEXIST")
+  }
+}
+
 // Dangling-announcement nudge (deterministic lane): sieve stage "dangling" =
 // announced action + colon/em-dash/comma ending, zero tool calls. Live base
 // rate Oct-9: 2/2 operator-confirmed true positives (ds4 "Banking now —
@@ -853,7 +870,7 @@ async function maybeAudit(sessionID, msgs, sessions, isSub, client) {
     if (DANGLING_MODE === "nudge" && !isSub && a.toolCount === 0 && client) {
       st.dnudged = st.dnudged || new Set()
       st.dnudgeCount = st.dnudgeCount || 0
-      if (!st.dnudged.has(a.messageID) && st.dnudgeCount < 2) {
+      if (!st.dnudged.has(a.messageID) && st.dnudgeCount < 2 && claimNudge("dangling." + a.messageID)) {
         st.dnudged.add(a.messageID)
         st.dnudgeCount++
         nudged = true
@@ -1019,6 +1036,7 @@ const ToolCallGuardPlugin = async ({ client }) => {
           sessions.set(sessionID, st)
         }
         if (st.nudged.has(a.messageID) || st.count >= 3) return
+        if (!claimNudge(a.messageID)) return
         st.nudged.add(a.messageID)
         st.count++
         await client.session.prompt({
@@ -1158,9 +1176,10 @@ ToolCallGuardPlugin.__test = {
 //      "title") deep-scrubs event.messages (scrubStrings is shape-agnostic,
 //      so it covers text/reasoning/tool args on the V2 wire format).
 //   3. Auto-continue— ctx.event.subscribe() on session.execution.succeeded
-//      (V2's turn-complete event; session.idle is V1-compat and NOT emitted
-//      on the V2 stream); V2 message-shape adapter analyzeMessagesV2; nudge
-//      via ctx.session.prompt.
+//      (V2's turn-complete event; the shared service may also deliver the
+//      V1-compat session.idle — both accepted, nudged-set dedupe covers it);
+//      V2 message-shape adapter analyzeMessagesV2; nudge via
+//      ctx.session.prompt.
 // NOT yet ported to V2 (V1 keeps them): pre-flight, binary guard, subreport
 // annotation, JEV confab, turn audit, janitor.
 const analyzeMessagesV2 = (raw) => {
@@ -1302,9 +1321,12 @@ const toolCallGuardV2Setup = async (ctx) => {
           } catch {}
         }
         try {
-          // V2 public stream: turn completion is session.execution.succeeded
-          // (the migration-guide example's session.idle is V1-compat and is
-          // NOT emitted on the V2 stream — verified live on 2.1.2).
+          // V2 turn-complete event is session.execution.succeeded; the
+          // V1-compat session.idle can ALSO arrive on the shared service
+          // (observed 2026-10-22: duplicate idles rows, same session+second,
+          // while an isolated standalone serve emitted only the new name).
+          // Double delivery is harmless: the per-message nudged-set dedupe
+          // below makes the second pass a no-op; only the idles log doubles.
           const isIdle = ev && (ev.type === "session.execution.succeeded" || ev.type === "session.idle")
           if (!isIdle) continue
           const d = (ev && ev.data) || {}
@@ -1327,6 +1349,7 @@ const toolCallGuardV2Setup = async (ctx) => {
             sessions.set(sessionID, st)
           }
           if (st.nudged.has(a.messageID) || st.count >= 3) continue
+          if (!claimNudge(a.messageID)) continue
           st.nudged.add(a.messageID)
           st.count++
           await ctx.session.prompt({ sessionID, text: NUDGE(a.tail) })
@@ -1354,6 +1377,7 @@ ToolCallGuardPlugin.__test = {
   DATA_DIR,
   guardSseResponse,
   analyzeMessagesV2,
+  claimNudge,
   toolCallGuardV2Setup,
 }
 

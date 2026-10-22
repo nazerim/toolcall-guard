@@ -55,6 +55,51 @@ process.env.TOOLCALL_GUARD = "off"
   assert.deepEqual(parse(run("")).registered, [...EXPECT_CORE, "SUBSCRIBE"], "on: core hooks + event subscription")
 }
 
+// --- cross-instance nudge claim (live-service finding 2026-10-22): the v2
+// service runs plugin setup once per LOCATION and every instance sees every
+// event — two instances must produce exactly ONE nudge per message. Child
+// process: lanes must be ON (MASTER_OFF freezes at module load) and the
+// claim dir is fresh per run.
+{
+  const { spawnSync } = await import("node:child_process")
+  const { fileURLToPath } = await import("node:url")
+  const { mkdtempSync } = await import("node:fs")
+  const { tmpdir } = await import("node:os")
+  const { join } = await import("node:path")
+  const core = fileURLToPath(new URL("../plugins/toolcall-guard.js", import.meta.url))
+  const dir = mkdtempSync(join(tmpdir(), "tcg-dual-"))
+  const mid = "msg_" + Date.now()
+  const child = `
+    process.env.TOOLCALL_GUARD_DATA_DIR = ${JSON.stringify(dir)}
+    const { default: plugin } = await import(${JSON.stringify(core)})
+    const prompts = []
+    const evt = { type: "session.execution.succeeded", data: { sessionID: "ses_dual" } }
+    const mkCtx = () => {
+      let sent = false
+      return {
+        session: {
+          hook: async () => {},
+          get: async () => ({ data: { id: "ses_dual" } }),
+          context: async () => ({ data: [{ type: "assistant", id: ${JSON.stringify(mid)}, agent: "build", finish: "stop", content: [{ type: "text", text: "cut it off here \`" }] }] }),
+          prompt: async () => { prompts.push(1) },
+        },
+        provider: { list: async () => { throw new Error("offline") } },
+        event: { subscribe: () => ({ [Symbol.asyncIterator]: () => ({ next: async () => (sent ? { done: true } : ((sent = true), { value: evt, done: false })) }) }) },
+      }
+    }
+    plugin.setup(mkCtx())
+    plugin.setup(mkCtx())
+    await new Promise((r) => setTimeout(r, 200))
+    console.log(JSON.stringify({ prompts: prompts.length }))
+  `
+  const r = spawnSync(process.execPath, ["--input-type=module", "-e", child], {
+    env: { ...process.env, TOOLCALL_GUARD: "" },
+    encoding: "utf8",
+  })
+  const out = JSON.parse(r.stdout.trim().split("\n").pop())
+  assert.equal(out.prompts, 1, "two plugin instances, one shared event -> exactly one nudge")
+}
+
 // --- analyzeMessagesV2 -----------------------------------------------------
 const asst = (over = {}, content = []) => ({ type: "assistant", id: "m1", agent: "build", finish: "stop", content, ...over })
 
