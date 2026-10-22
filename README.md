@@ -93,7 +93,14 @@ Not yet ported to V2 (V1 keeps them): pre-flight, binary guard, subreport
 annotation, JEV confab, turn audit, janitor.
 
 V2 marker/log files land in `$XDG_DATA_HOME/opencode/` (the V1 default when
-unset) — the `DATA_DIR()` helper keeps one file correct for both installs.
+unset; `TOOLCALL_GUARD_DATA_DIR` overrides both). The V2 marker
+(`toolcall-guard.loaded`) reads `{entry:"v2", providersWrapped:1,
+openaiSeen:N, lanes:"on"|"off"}` — `providersWrapped:1` means the global
+guard hook is registered (V2 wraps once per stream, not per provider);
+`lanes:"off"` distinguishes a deliberate `TOOLCALL_GUARD=off` from a plugin
+that never loaded. `TOOLCALL_GUARD=off` on V2 keeps the stream guard and
+scrubber active and disables only the auto-continue lane — the same
+contract as V1 (unit-tested in `test/v2.test.mjs`).
 
 V2 quirks found while verifying (fixture + harness handle all of them):
 
@@ -196,6 +203,7 @@ Provider-scoped to `qwen|ds4` by default (`TOOLCALL_GUARD_SCRUB_PROVIDERS`).
 | `TOOLCALL_GUARD_SUBREPORT` | `off` \| log-only (unset) \| `annotate` (append fact + resume-with-task-id hint to empty/clipped subagent reports in the outbound copy) | log |
 | `TOOLCALL_GUARD_SCRUB_PROVIDERS` | regex | `qwen\|ds4` |
 | `TOOLCALL_GUARD_CONFAB_LOG` | log path override | real log (tests point here) |
+| `TOOLCALL_GUARD_DATA_DIR` | absolute dir override for all markers/logs (wins over `XDG_DATA_HOME`) — pin it when a process might inherit the other install's env | unset |
 
 Privacy: the audit and scrub lanes send turn text (request + reply tail /
 passage) to the configured URL — localhost by default, never remote unless

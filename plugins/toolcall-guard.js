@@ -29,9 +29,14 @@ import { join } from "node:path"
 
 // State/log dir. XDG_DATA_HOME wins when set (V2 wrapper exports
 // ~/.opencode2/data → markers land in the v2 data dir; default unset → V1's
-// ~/.local/share/opencode). Tests that sandbox HOME must also pin
-// XDG_DATA_HOME (see test/*.mjs) — XDG takes precedence per spec.
-const DATA_DIR = () => join(process.env.XDG_DATA_HOME || join(homedir(), ".local", "share"), "opencode")
+// ~/.local/share/opencode). TOOLCALL_GUARD_DATA_DIR overrides everything —
+// pin it when a process might inherit the other install's environment
+// (the janitor deletes files, so it must never sweep the wrong install by
+// accident). Tests that sandbox HOME must also pin XDG_DATA_HOME (see
+// test/*.mjs) — XDG takes precedence per spec.
+const DATA_DIR = () =>
+  process.env.TOOLCALL_GUARD_DATA_DIR ||
+  join(process.env.XDG_DATA_HOME || join(homedir(), ".local", "share"), "opencode")
 
 const cleanName = (v) => (typeof v === "string" ? v.replace(/^[\s`]+|[\s`]+$/g, "") : "")
 
@@ -1187,18 +1192,31 @@ const analyzeMessagesV2 = (raw) => {
 }
 
 const toolCallGuardV2Setup = async (ctx) => {
-  if (MASTER_OFF) return
   const logFile = (name, obj) => {
     try {
       appendFileSync(join(DATA_DIR(), name), JSON.stringify({ at: nowStamp(), ...obj }) + "\n")
     } catch {}
   }
-  // openai-compatible provider allowlist (mirrors the V1 config-hook filter).
-  // ctx.provider.list() can reject while the registry is still booting, so
-  // resolution is lazy + non-fatal: gate stays OPEN until resolved and only
-  // then filters; the SSE content-type check is always the safety net.
+  // Informational only: openai-compatible provider count for the marker.
+  // ctx.provider.list() can reject while the registry boots and custom
+  // providers activate after plugin load, so this is best-effort — nothing
+  // is gated on it (hook 1 gates on content-type, see below).
   const openaiSet = new Set()
   let providersResolved = false
+  const writeMarker = () => {
+    try {
+      writeFileSync(
+        join(DATA_DIR(), "toolcall-guard.loaded"),
+        JSON.stringify({
+          at: nowStamp(),
+          entry: "v2",
+          providersWrapped: LIVE.wrapped > 0 ? 1 : 0, // 1 = global guard hook registered
+          openaiSeen: openaiSet.size,
+          lanes: MASTER_OFF ? "off" : "on",
+        }) + "\n",
+      )
+    } catch {}
+  }
   const resolveProviders = async () => {
     if (providersResolved) return
     try {
@@ -1217,49 +1235,57 @@ const toolCallGuardV2Setup = async (ctx) => {
         const pid = (p && p.id) || info.id
         if (pid && pkg.includes("openai-compatible")) openaiSet.add(String(pid))
       }
-      LIVE.wrapped = Math.max(LIVE.wrapped, openaiSet.size)
-      try {
-        writeFileSync(
-          join(DATA_DIR(), "toolcall-guard.loaded"),
-          JSON.stringify({ at: nowStamp(), entry: "v2", providersWrapped: openaiSet.size }) + "\n",
-        )
-      } catch {}
+      writeMarker() // lands after the setup write: strictly fresher openaiSeen
     } catch {}
   }
   void resolveProviders()
 
-  // 1) SSE guard on native provider HTTP responses. Gated on content-type
-  // only (guardSseResponse): provider.list() is incomplete while custom
-  // providers activate, so an allowlist here would race — and is unnecessary,
-  // handleLine passes non-OpenAI-shaped SSE lines through byte-identical.
-  await ctx.session.hook("http.response", (event) => {
-    try {
-      LIVE.requests++
-      const g = guardSseResponse(event.response)
-      event.response = g.res
-      if (!g.guarded) checkLiveness()
-    } catch {}
-  })
-
-  // 2) outbound-history scrub on every model-request kind (V1's single
-  // messages.transform covered all of them via the shared fetch path)
-  if (SCRUB_MODE) {
-    const scrubPass = (event) => {
+  // 1) SSE guard on native provider HTTP responses. CORE layer: NOT affected
+  // by TOOLCALL_GUARD=off — same contract as V1, whose config hook always
+  // wraps. Gated on content-type only (guardSseResponse): provider.list() is
+  // incomplete while custom providers activate, so an allowlist here would
+  // race — and is unnecessary, handleLine passes non-OpenAI-shaped SSE lines
+  // through byte-identical.
+  try {
+    await ctx.session.hook("http.response", (event) => {
       try {
-        const stats = { n: 0 }
-        scrubStrings(event.messages, stats)
-        if (stats.n > 0) logFile("toolcall-guard.scrubbed", { rewrites: stats.n })
+        LIVE.requests++
+        const g = guardSseResponse(event.response)
+        event.response = g.res
+        if (!g.guarded) checkLiveness()
       } catch {}
-    }
-    for (const kind of ["context", "compaction", "generate", "title"]) {
-      try {
-        await ctx.session.hook(kind, scrubPass)
-      } catch {}
-    }
+    })
+    LIVE.wrapped = Math.max(LIVE.wrapped, 1)
+  } catch (e) {
+    logFile("toolcall-guard.errors", { lane: "v2-register", hook: "http.response", err: String((e && e.message) || e).slice(0, 300) })
   }
 
-  // 3) auto-continue on session.idle (clipKind heuristic; once per assistant
-  // message, max 3 per session, subagent sessions and aborted turns skipped)
+  // 2) outbound-history scrub on every model-request kind (V1's single
+  // messages.transform covered all of them via the shared fetch path).
+  // CORE layer, unconditional: on V1 the ChatML scrub runs regardless of
+  // lane flags — TOOLCALL_GUARD_SCRUB gates only the confab lane (not
+  // ported), never this one.
+  const scrubPass = (event) => {
+    try {
+      const stats = { n: 0 }
+      scrubStrings(event.messages, stats)
+      if (stats.n > 0) logFile("toolcall-guard.scrubbed", { rewrites: stats.n })
+    } catch {}
+  }
+  for (const kind of ["context", "compaction", "generate", "title"]) {
+    try {
+      await ctx.session.hook(kind, scrubPass)
+    } catch (e) {
+      logFile("toolcall-guard.errors", { lane: "v2-register", hook: kind, err: String((e && e.message) || e).slice(0, 300) })
+    }
+  }
+  writeMarker()
+
+  // 3) auto-continue — a recovery LANE, disabled by TOOLCALL_GUARD=off
+  // (V1: the event handler early-returns when every lane is off).
+  // clipKind heuristic; once per assistant message, max 3 per session,
+  // subagent sessions and aborted turns skipped.
+  if (MASTER_OFF) return
   const sessions = new Map()
   const controller = new AbortController()
   const evProbe = (process.env.TOOLCALL_GUARD_V2_DEBUG || "").toLowerCase() === "events"
@@ -1293,6 +1319,10 @@ const toolCallGuardV2Setup = async (ctx) => {
           if (!a) continue
           let st = sessions.get(sessionID)
           if (!st) {
+            // long-lived serve: clip-state is per-session; cap growth by
+            // clearing wholesale on overflow (losing nudge budgets for very
+            // old sessions is the acceptable failure mode)
+            if (sessions.size > 500) sessions.clear()
             st = { nudged: new Set(), count: 0 }
             sessions.set(sessionID, st)
           }
@@ -1309,13 +1339,6 @@ const toolCallGuardV2Setup = async (ctx) => {
       logFile("toolcall-guard.errors", { lane: "v2-subscribe", err: String((e && e.message) || e).slice(0, 300) })
     }
   })()
-
-  try {
-    writeFileSync(
-      join(DATA_DIR(), "toolcall-guard.loaded"),
-      JSON.stringify({ at: nowStamp(), entry: "v2", providersWrapped: openaiSet.size }) + "\n",
-    )
-  } catch {}
 
   return () => controller.abort()
 }

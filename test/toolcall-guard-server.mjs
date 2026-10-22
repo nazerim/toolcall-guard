@@ -1,4 +1,5 @@
 import http from "node:http"
+import { appendFileSync } from "node:fs"
 
 const PORT = Number(process.env.PORT || 8787)
 const SCENARIO = process.env.SCENARIO || "late"
@@ -68,7 +69,7 @@ http
         parsed = {}
       }
       const dump = process.env.GUARDTEST_REQS || "reqs.jsonl"
-      import("node:fs").then((fs) => fs.appendFileSync(dump, body + "\n"))
+      try { appendFileSync(dump, body + "\n") } catch {}
       if (process.env.GUARDTEST_VERBOSE) {
         const blob0 = JSON.stringify(parsed.messages || [])
         console.error(
@@ -102,6 +103,10 @@ http
       // instruction is the unambiguous marker; tool-role messages are the
       // tool-result marker.
       const hasToolResult = (parsed.messages || []).some((m) => m && m.role === "tool")
+      // NOTE: matches NUDGE's resume phrase only. A DANGLING_NUDGE (lane
+      // TOOLCALL_GUARD_DANGLING=nudge, not exercised by the four shipped
+      // scenarios) contains neither that phrase nor a tool result, so the
+      // fixture would re-serve the scenario after a dangling nudge.
       const wasNudged = blob.includes("Resume exactly where you stopped")
       // V2 renamed the bash tool to shell — call whichever the harness offers
       const toolNames = (parsed.tools || []).map((t) => (t.function && t.function.name) || t.name)

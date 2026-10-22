@@ -25,10 +25,9 @@ export OPENCODE_DISABLE_AUTOUPDATE=1
 rm -rf $T && mkdir -p $T/config/opencode $T/data $T/cache
 
 for SC in late drop poison clip; do
-  pkill -f toolcall-guard-server 2>/dev/null
-  sleep 0.4
   rm -f $REPO/test/reqs.jsonl
-  (SCENARIO=$SC PORT=8787 GUARDTEST_REQS=$REPO/test/reqs.jsonl nohup node $REPO/test/toolcall-guard-server.mjs > $T/server-$SC.log 2>&1 &)
+  SCENARIO=$SC PORT=8787 GUARDTEST_REQS=$REPO/test/reqs.jsonl node $REPO/test/toolcall-guard-server.mjs > $T/server-$SC.log 2>&1 &
+  SRV=$!
   sleep 0.8
   rm -rf $T/data && mkdir -p $T/data
   OUT=$(cd $REPO/test && XDG_CONFIG_HOME=$T/config XDG_DATA_HOME=$T/data XDG_CACHE_HOME=$T/cache OPENCODE_CONFIG=$CFG $BIN run --standalone --auto -m guardtest/guardtest-model "say hi MARKER7788" 2>&1 | tail -2 | tr '\n' ' ')
@@ -46,6 +45,6 @@ for SC in late drop poison clip; do
   [ -n "$SCRUB" ] && echo "   scrubbed: $SCRUB"
   [ -n "$CLIPF" ] && echo "   clips:    $CLIPF"
   [ -n "$ERRS" ] && echo "   errors:   $ERRS"
+  kill $SRV 2>/dev/null; wait $SRV 2>/dev/null
 done
-pkill -f toolcall-guard-server 2>/dev/null
 echo done

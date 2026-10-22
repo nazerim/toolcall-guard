@@ -25,6 +25,36 @@ assert.equal(typeof plugin, "function", "V1 default export stays a callable func
 }
 process.env.TOOLCALL_GUARD = "off"
 
+// --- MASTER_OFF semantics (independent review H1): off disables the
+// auto-continue lane but must NOT disable the core stream guard or the
+// ChatML scrubber — the V1 contract (README: "stream guard + scrubber core
+// is not affected"). Subprocess run: MASTER_OFF freezes at module load.
+{
+  const { spawnSync } = await import("node:child_process")
+  const { fileURLToPath } = await import("node:url")
+  const core = fileURLToPath(new URL("../plugins/toolcall-guard.js", import.meta.url))
+  const child = `
+    const { default: plugin } = await import(${JSON.stringify(core)})
+    const registered = []
+    const ctx = {
+      session: { hook: async (name) => { registered.push(name) } },
+      provider: { list: async () => { throw new Error("offline") } },
+      event: { subscribe: () => { registered.push("SUBSCRIBE"); return { [Symbol.asyncIterator]: () => ({ next: async () => ({ done: true }) }) } } },
+    }
+    await plugin.setup(ctx)
+    console.log(JSON.stringify({ registered }))
+  `
+  const run = (guard) =>
+    spawnSync(process.execPath, ["--input-type=module", "-e", child], {
+      env: { ...process.env, TOOLCALL_GUARD: guard },
+      encoding: "utf8",
+    })
+  const parse = (r) => JSON.parse(r.stdout.trim().split("\n").pop())
+  const EXPECT_CORE = ["http.response", "context", "compaction", "generate", "title"]
+  assert.deepEqual(parse(run("off")).registered, EXPECT_CORE, "off: core hooks registered, event lane skipped")
+  assert.deepEqual(parse(run("")).registered, [...EXPECT_CORE, "SUBSCRIBE"], "on: core hooks + event subscription")
+}
+
 // --- analyzeMessagesV2 -----------------------------------------------------
 const asst = (over = {}, content = []) => ({ type: "assistant", id: "m1", agent: "build", finish: "stop", content, ...over })
 
