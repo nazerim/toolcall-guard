@@ -232,12 +232,12 @@ Provider-scoped to `qwen|ds4` by default (`TOOLCALL_GUARD_SCRUB_PROVIDERS`).
 
 Privacy: the audit and scrub lanes send turn text (request + reply tail /
 passage) to the configured URL — localhost by default, never remote unless
-you point it there. Preflight logs command snippets; the confab log may
+you point it there. V2 restricts classifier endpoints to numeric loopback (`127.0.0.1` / `[::1]`, no credentials, query, fragment or redirects) and sends text only with `TOOLCALL_GUARD_AUDIT_SEND=1` (audit) or `TOOLCALL_GUARD_SCRUB_JEV=1` (confab). Preflight logs command snippets; the confab log may
 contain quoted reasoning snippets. All logs live under
 `~/.local/share/opencode/toolcall-guard.*` (or `$XDG_DATA_HOME/opencode/`
 when set — the V2 install) (`audit`, `audit.shadow`,
 `preflight`, `confab`, `clips`, `scrubbed`, `idles`, `errors`, `loaded`, `binary`, `janitor`,
-plus `nudge.<messageID>` / `nudge.dangling.<messageID>` claim files (exclusive-create tokens
+plus `nudge.<messageID>` / `nudge.dangling.<messageID>` and V2 `audit-nudge.<sha256>` claim files (exclusive-create tokens
 guarantee one nudge per message across all plugin instances — the V2 service runs setup once
 per location and every instance sees every shared-stream event).
 

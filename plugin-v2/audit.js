@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto"
-import { appendFileSync } from "node:fs"
+import { appendFileSync, lstatSync, readdirSync, unlinkSync } from "node:fs"
 import { join } from "node:path"
 
 // V2 is opt-in: log and 1 score residue at .5; overnight uses .6.
@@ -25,9 +25,27 @@ const nudgeText = "[toolcall-guard turn audit] Your previous reply ended with an
 // Own and core auto-continue nudges: replies to them are not scored.
 const ownNudge = /^\[toolcall-guard (?:auto-continue|turn audit)\] /
 const states = new Map()
-export const __test = { states, maxSessions, idleMs }
+// Process-wide housekeeping clocks: claim sweep (hourly) and in-flight log (60 s).
+const housekeeping = { sweptAt: -Infinity, inFlightAt: -Infinity }
+const claimPrefix = "toolcall-guard.audit-nudge."
+const claimMaxAge = 24 * 60 * 60 * 1000
+export const __test = { states, maxSessions, idleMs, housekeeping }
 let scoring = false
 let retryAfter = 0
+
+// Removes stale nudge claims. Only regular files with the exact prefix are
+// unlinked; lstat means symlinks (and directories) are left untouched.
+function sweepNudgeClaims(dir, now) {
+  try {
+    for (const name of readdirSync(dir)) {
+      if (!name.startsWith(claimPrefix)) continue
+      try {
+        const info = lstatSync(join(dir, name))
+        if (info.isFile() && now - info.mtimeMs > claimMaxAge) unlinkSync(join(dir, name))
+      } catch {}
+    }
+  } catch {}
+}
 
 const unwrap = (raw) => raw?.data ?? raw
 // At f870161 the Promise plugin adapter drops requestOptions, so a signal
@@ -139,6 +157,11 @@ export async function setupAudit(ctx, { clipKind, sieveStage, AUDIT_Q, DATA_DIR 
     const age = Date.now() - event?.created
     if (event?.type !== completion || !validID(event.id, "evt_") ||
         !validID(sessionID, "ses_") || !(age >= 0 && age < maxAge)) return
+    const sweepNow = Date.now()
+    if (sweepNow - housekeeping.sweptAt >= 60 * 60 * 1000) {
+      housekeeping.sweptAt = sweepNow
+      sweepNudgeClaims(dir, sweepNow)
+    }
     const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(maxAge - age)])
     const args = { sessionID }
     const opts = { signal }
@@ -199,7 +222,15 @@ export async function setupAudit(ctx, { clipKind, sieveStage, AUDIT_Q, DATA_DIR 
       log(stage, child, { fired: false })
       return
     }
-    if (scoring || Date.now() < retryAfter || state.scores >= maxScores) return
+    if (scoring) {
+      const now = Date.now()
+      if (now - housekeeping.inFlightAt >= 60_000) {
+        housekeeping.inFlightAt = now
+        log("scoring", child, { reason: "in-flight-skip" })
+      }
+      return
+    }
+    if (Date.now() < retryAfter || state.scores >= maxScores) return
     scoring = true
     state.scores++
     try {

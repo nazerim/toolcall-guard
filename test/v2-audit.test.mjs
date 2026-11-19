@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { after, test } from "node:test"
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs"
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import core from "../plugins/toolcall-guard.js"
@@ -279,4 +279,77 @@ test("session cap evicts idle sessions; a full active cap skips with one metadat
   await f.send(turn(dangling))
   assert.deepEqual(f.logs.map((r) => r.stage), ["skipped", "dangling"])
   assert.equal(states.size, 1)
+})
+
+test("stale nudge claims are swept at most hourly; exact prefix and regular files only", async (t) => {
+  const { housekeeping } = auditState
+  mockClassifier(t)
+  housekeeping.sweptAt = -Infinity
+  t.after(() => { housekeeping.sweptAt = -Infinity })
+  const dir = mkdtempSync(join(root, "sweep-"))
+  const old = new Date(Date.now() - 25 * 60 * 60 * 1000)
+  const write = (name, when = old) => {
+    const path = join(dir, name)
+    writeFileSync(path, "")
+    utimesSync(path, when, when)
+    return path
+  }
+  const stale = write("toolcall-guard.audit-nudge.aaaa")
+  const fresh = write("toolcall-guard.audit-nudge.bbbb", new Date())
+  const lookalike = write("toolcall-guard.audit-nudgeX.cccc")
+  const plain = write("toolcall-guard.audit")
+  const outside = join(root, "sweep-target")
+  writeFileSync(outside, "")
+  utimesSync(outside, old, old)
+  const link = join(dir, "toolcall-guard.audit-nudge.link")
+  symlinkSync(outside, link)
+  const folder = join(dir, "toolcall-guard.audit-nudge.dir")
+  mkdirSync(folder)
+  // Dangling stage never scores, so the sweep is the only side effect here.
+  const f = await fixture(t, { mode: "log", dir })
+  await f.send(turn(dangling))
+  assert.equal(existsSync(stale), false)
+  for (const kept of [fresh, lookalike, plain, outside, folder]) assert.equal(existsSync(kept), true)
+  assert.equal(lstatSync(link).isSymbolicLink(), true)
+  // Within the hour: a newly stale claim survives the next event...
+  const later = write("toolcall-guard.audit-nudge.dddd")
+  await f.send(turn(dangling))
+  assert.equal(existsSync(later), true)
+  // ...until the hourly clock is due again.
+  housekeeping.sweptAt = -Infinity
+  await f.send(turn(dangling))
+  assert.equal(existsSync(later), false)
+})
+
+test("residue dropped by an in-flight scoring call logs at most once per 60 s", async (t) => {
+  const { housekeeping } = auditState
+  housekeeping.inFlightAt = -Infinity
+  t.after(() => { housekeeping.inFlightAt = -Infinity })
+  // Step past any classifier cooldown left by earlier tests.
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() + 200_000 })
+  let release
+  const gate = new Promise((resolve) => { release = resolve })
+  const calls = mockClassifier(t, async () => {
+    await gate
+    return Response.json({ answers: { q: { probabilities: { assistant: 0.2 } } } })
+  })
+  const first = await fixture(t, { mode: "1" })
+  const second = await fixture(t, { mode: "1", dir: first.dir })
+  const inFlight = first.send(turn())
+  try {
+    await second.send(turn())
+    await second.send(turn())
+    housekeeping.inFlightAt -= 61_000
+    await second.send(turn())
+    assert.equal(calls.length, 1)
+  } finally {
+    release()
+    await inFlight
+  }
+  const scoring = first.logs.filter((r) => r.stage === "scoring")
+  assert.deepEqual(scoring.map(({ at, ...r }) => r), [
+    { v: 4, mode: "1", stage: "scoring", child: false, reason: "in-flight-skip" },
+    { v: 4, mode: "1", stage: "scoring", child: false, reason: "in-flight-skip" },
+  ])
+  assert.deepEqual(first.logs.filter((r) => r.stage === "residue").map((r) => r.p), [0.2])
 })
