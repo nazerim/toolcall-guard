@@ -89,8 +89,32 @@ V2 layers ported (env flags shared with V1):
 | `experimental.chat.messages.transform` | `ctx.session.hook("context"/"compaction"/"generate"/"title")` + `scrubStrings` (shape-agnostic deep walk covers V2 text/reasoning/tool-arg parts) |
 | `event` on `session.idle` | `ctx.event.subscribe()` on **`session.execution.succeeded`** — V2's turn-complete event. The shared V2 service runs plugin setup once PER LOCATION and may also deliver the V1-compat `session.idle` per turn, so one event can reach several instances: nudges are guarded by an exclusive-create claim file per message (`toolcall-guard.nudge.<messageID>`), making double delivery a functional no-op (only the `idles` log doubles). Message shape via `ctx.session.context()` (`{data:[…]}` envelope; `finish` presence replaces the step-finish-part abort check) |
 
-Not yet ported to V2 (V1 keeps them): pre-flight, binary guard, subreport
-annotation, JEV confab, turn audit, janitor.
+The six legacy lanes are ported as **opt-in** V2 lanes (off unless set;
+V1's `0`/`off` also mean off). Details: [lane status](docs/v2-legacy-lanes.md),
+[live vs fixture-only verification](docs/v2-port-queue.md).
+
+| V2 flag (`TOOLCALL_GUARD_…`) | Values | Effect |
+|---|---|---|
+| (master) `TOOLCALL_GUARD` | `off` | disables all lanes + auto-continue; stream guard and scrubber stay |
+| `PREFLIGHT` | `1`\|`log`\|`block` | log rule hits on `shell`; `block` refuses |
+| `CLAMP` (+`CLAMP_MS`) | `1` (ms, default 120000) | timeout on scan-like commands lacking one |
+| `BINARY` | `1` | NUL-bearing tool text → notice (model input only, not UI) |
+| `SUBREPORT` | `log`\|`annotate` | empty/clipped child reports; `annotate` adds resume hint to outbound copy |
+| `SCRUB` (+`SCRUB_JEV`) | `1`\|`log`\|`strip` (`1`) | confab rules; `strip` drops matched reasoning; `SCRUB_JEV=1` enables classifier tier |
+| `AUDIT` (+`AUDIT_SEND`, `DANGLING`) | `1`\|`log`\|`overnight` (`1`, `nudge`) | turn audit; `AUDIT_SEND=1` sends text to classifier; `DANGLING=nudge` (not with `log`) queues one nudge |
+| `JANITOR` | `1`\|`dry` | early delete (or count) of >1 GB, >24 h tool-output spills |
+
+> **Warning:** V1-era exports in a shell profile (e.g. `TOOLCALL_GUARD_AUDIT=1`,
+> `TOOLCALL_GUARD_SCRUB=strip`, `TOOLCALL_GUARD_JANITOR=1`,
+> `TOOLCALL_GUARD_PREFLIGHT=block`) **now activate the V2 lanes** too. Unset
+> them or set `TOOLCALL_GUARD=off` if you do not want that.
+
+- The janitor sweeps **once per process** (startup; cross-process claim
+  throttles to one sweep per 6 h). OpenCode itself already prunes tool-output
+  spills after **7 days**, so enable it only under disk pressure.
+- Audit with `AUDIT_SEND=1` sends the latest user request prefix and reply
+  tail to the local (loopback) classifier; `SCRUB_JEV=1` sends reasoning
+  passages. Without these second opt-ins nothing leaves the process.
 
 V2 marker/log files land in `$XDG_DATA_HOME/opencode/` (the V1 default when
 unset; `TOOLCALL_GUARD_DATA_DIR` overrides both). The V2 marker
@@ -99,8 +123,9 @@ openaiSeen:N, lanes:"on"|"off"}` — `providersWrapped:1` means the global
 guard hook is registered (V2 wraps once per stream, not per provider);
 `lanes:"off"` distinguishes a deliberate `TOOLCALL_GUARD=off` from a plugin
 that never loaded. `TOOLCALL_GUARD=off` on V2 keeps the stream guard and
-scrubber active and disables only the auto-continue lane — the same
-contract as V1 (unit-tested in `test/v2.test.mjs`).
+scrubber active and disables auto-continue plus every opt-in lane — the
+same contract as V1 (unit-tested in `test/v2.test.mjs` and the
+`test/v2-*.test.mjs` lane suites).
 
 V2 quirks found while verifying (fixture + harness handle all of them):
 
@@ -124,7 +149,7 @@ Applies automatically to every provider whose `npm` is
 ~/.local/share/opencode/toolcall-guard.clips      # auto-continue firings
 ```
 
-## Observation lanes (on by default; `off` to opt out)
+## Observation lanes (V1: on by default, `off` to opt out; V2: opt-in, see table above)
 
 Feature-flagged via environment; nothing below activates unless you set its
 flag. They share one dependency: a [Rizzo Flow](https://github.com/Rizzo-AI-Academy/rizzo-flow)
@@ -184,7 +209,7 @@ TOOLCALL_GUARD_SCRUB=strip opencode      # + strip rule-matched reasoning
 prose *about* confabulation matches the signatures (measured, both tiers).
 Provider-scoped to `qwen|ds4` by default (`TOOLCALL_GUARD_SCRUB_PROVIDERS`).
 
-### All flags
+### All flags (V1 defaults; V2 values in the V2 section)
 
 | Var | Values | Default |
 |---|---|---|
@@ -217,6 +242,23 @@ guarantee one nudge per message across all plugin instances — the V2 service r
 per location and every instance sees every shared-stream event).
 
 ## Tests
+
+**Stream liveness on V2 (verified with installed OpenCode 2.3.2):** the old
+`zero SSE streams intercepted` warning used V1's `options.fetch` heuristic
+inside V2's `http.response` hook. On V2 the counter measured responses, not
+model calls; 25 ordinary JSON responses sufficed to trigger the warning.
+It did not prove bypass. V1 retains its heuristic. V2 now records the 25th
+successful non-SSE response as informational (`toolcall-guard.stream-info`),
+and reports HTTP errors, invalid responses, missing SSE bodies, or wrapping
+failures separately in `toolcall-guard.errors` (once per reason per setup).
+These observations cannot detect a hook that is never invoked.
+
+`python3 test/isolated-v2.py` runs a loopback late-name fixture through
+`opencode run --standalone` with fresh HOME/XDG paths, an allowlisted child
+environment and only the fixture provider enabled. It requires the actual
+repair marker (`TOOLCALL_GUARD_V2_DEBUG=stream`, no payloads), a tool result
+with `GUARD_OK` on the next request, and the final `ALL_DONE` reply. The
+private fixture directory is removed after the run.
 
 ```bash
 for t in test/*.test.mjs; do node $t; done   # unit suites, incl. test/v2.test.mjs
@@ -271,8 +313,8 @@ endpoint.
   `step-finish` discriminator).
 - Modes 2/3 are the **provider's** parser bug; the guard can only absorb
   their consequences, not prevent clipped replies.
-- Scoped to opencode 1.x (AI-SDK runtime + plugin API); opencode v2 is not
-  targeted.
+- V2 support covers the core plus opt-in lanes; several V2 lanes are
+  verified only against fixtures/mocks (see `docs/v2-port-queue.md`).
 
 ## License
 

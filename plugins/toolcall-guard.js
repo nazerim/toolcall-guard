@@ -23,7 +23,8 @@
 //     as plain text and the session survives;
 //   - well-formed streams pass through byte-identical.
 
-import { appendFileSync, writeFileSync, readdirSync, statSync, unlinkSync } from "node:fs"
+import { appendFileSync, writeFileSync, readdirSync, renameSync, statSync, unlinkSync } from "node:fs"
+import { randomUUID } from "node:crypto"
 import { homedir } from "node:os"
 import { join } from "node:path"
 
@@ -120,6 +121,7 @@ function processToolCalls(st, ev) {
         s.open = true
         if (st.lastPending === idx) st.lastPending = -1
         keep.push({ index: idx, id: s.id, function: { name: s.name, arguments: s.args } })
+        st.onRepair?.()
         touched = true
       } else {
         if (!st.closed) st.lastPending = idx
@@ -184,13 +186,15 @@ function checkLiveness() {
 // SSE interception core: pipe one streaming chat-completions response through
 // the line state machine; anything not ok/SSE passes through untouched
 // (returned as-is with guarded=false so callers can keep their liveness math).
-function guardSseResponse(res) {
+function guardSseResponse(res, onRepair) {
   try {
-    if (!res || !res.ok || !res.body) return { res, guarded: false }
+    if (!res || typeof res.ok !== "boolean") return { res, guarded: false, reason: "invalid-response" }
+    if (!res.ok) return { res, guarded: false, reason: "http-error" }
     const ct = (res.headers && res.headers.get("content-type")) || ""
-    if (!ct.includes("text/event-stream")) return { res, guarded: false }
-    LIVE.streams++
+    if (ct.split(";")[0].trim().toLowerCase() !== "text/event-stream") return { res, guarded: false, reason: "non-sse" }
+    if (!res.body) return { res, guarded: false, reason: "missing-sse-body" }
     const st = newState()
+    st.onRepair = onRepair
     const td = new TextDecoder()
     const te = new TextEncoder()
     const guarded = res.body.pipeThrough(
@@ -216,9 +220,11 @@ function guardSseResponse(res) {
         },
       }),
     )
-    return { res: new Response(guarded, { status: res.status, statusText: res.statusText, headers: res.headers }), guarded: true }
+    const out = new Response(guarded, { status: res.status, statusText: res.statusText, headers: res.headers })
+    LIVE.streams++
+    return { res: out, guarded: true }
   } catch {
-    return { res, guarded: false }
+    return { res, guarded: false, reason: "wrap-failed" }
   }
 }
 
@@ -1180,8 +1186,9 @@ ToolCallGuardPlugin.__test = {
 //      V1-compat session.idle — both accepted, nudged-set dedupe covers it);
 //      V2 message-shape adapter analyzeMessagesV2; nudge via
 //      ctx.session.prompt.
-// NOT yet ported to V2 (V1 keeps them): pre-flight, binary guard, subreport
-// annotation, JEV confab, turn audit, janitor.
+// The optional lanes (pre-flight, binary guard, subreport, confab, turn
+// audit, janitor) live in plugin-v2/*.js and are composed by
+// plugin-v2/setup-lanes.js after this core setup.
 const analyzeMessagesV2 = (raw) => {
   // ctx.session.context() answers with a {data:[...]} envelope — unwrap.
   const msgs = Array.isArray(raw) ? raw : (raw && Array.isArray(raw.data) ? raw.data : [])
@@ -1211,6 +1218,25 @@ const analyzeMessagesV2 = (raw) => {
 }
 
 const toolCallGuardV2Setup = async (ctx) => {
+  // Hook registrations are released by the returned cleanup (with the
+  // event-subscription abort), so teardown leaves no core hook behind.
+  const registrations = []
+  const keep = (registration) => {
+    if (typeof registration?.dispose === "function") registrations.push(registration)
+  }
+  let controller
+  const cleanup = async () => {
+    controller?.abort()
+    const failures = []
+    while (registrations.length) {
+      try {
+        await registrations.pop().dispose()
+      } catch (err) {
+        failures.push(err)
+      }
+    }
+    if (failures.length) throw new AggregateError(failures, "core hook teardown failed")
+  }
   const logFile = (name, obj) => {
     try {
       appendFileSync(join(DATA_DIR(), name), JSON.stringify({ at: nowStamp(), ...obj }) + "\n")
@@ -1243,16 +1269,23 @@ const toolCallGuardV2Setup = async (ctx) => {
       providersResolved = true
       const list = Array.isArray(raw) ? raw : (raw && Array.isArray(raw.data) ? raw.data : [])
       const probe = (process.env.TOOLCALL_GUARD_V2_DEBUG || "").toLowerCase()
-      if (probe === "dump") {
-        try {
-          writeFileSync(join(DATA_DIR(), "toolcall-guard.provider-dump.json"), JSON.stringify(list, null, 1))
-        } catch {}
-      }
+      const summary = probe === "dump" ? [] : null
       for (const p of list) {
         const info = (p && p.info) || p || {}
-        const pkg = String(info.package || info.npm || "")
+        const pkg = info.package || info.npm
         const pid = (p && p.id) || info.id
-        if (pid && pkg.includes("openai-compatible")) openaiSet.add(String(pid))
+        if (typeof pid !== "string" || typeof pkg !== "string") continue
+        // Package specifiers may be git/HTTPS URLs containing credentials.
+        if (summary) summary.push({ id: pid, openaiCompatible: pkg.includes("openai-compatible") })
+        if (pid && pkg.includes("openai-compatible")) openaiSet.add(pid)
+      }
+      if (summary) {
+        const target = join(DATA_DIR(), "toolcall-guard.provider-dump.json")
+        const tmp = `${target}.${randomUUID()}`
+        try {
+          writeFileSync(tmp, JSON.stringify(summary, null, 1), { flag: "wx", mode: 0o600 })
+          renameSync(tmp, target)
+        } catch { try { unlinkSync(tmp) } catch {} }
       }
       writeMarker() // lands after the setup write: strictly fresher openaiSeen
     } catch {}
@@ -1266,14 +1299,31 @@ const toolCallGuardV2Setup = async (ctx) => {
   // race — and is unnecessary, handleLine passes non-OpenAI-shaped SSE lines
   // through byte-identical.
   try {
-    await ctx.session.hook("http.response", (event) => {
+    const reported = new Set()
+    let nonSse = 0
+    const onRepair = process.env.TOOLCALL_GUARD_V2_DEBUG?.toLowerCase() === "stream" ? () => {
+      if (reported.has("repaired")) return
+      reported.add("repaired")
+      logFile("toolcall-guard.stream-info", { lane: "v2-http-response", reason: "repaired" })
+    } : undefined
+    keep(await ctx.session.hook("http.response", (event) => {
       try {
-        LIVE.requests++
-        const g = guardSseResponse(event.response)
-        event.response = g.res
-        if (!g.guarded) checkLiveness()
-      } catch {}
-    })
+        const g = guardSseResponse(event.response, onRepair)
+        if (g.guarded) event.response = g.res
+        else if (g.reason === "non-sse") {
+          if (++nonSse === LIVENESS_MIN)
+            logFile("toolcall-guard.stream-info", { lane: "v2-http-response", reason: g.reason, count: nonSse })
+        } else if (!reported.has(g.reason)) {
+          reported.add(g.reason)
+          logFile("toolcall-guard.errors", { lane: "v2-http-response", reason: g.reason })
+        }
+      } catch {
+        if (!reported.has("hook-failed")) {
+          reported.add("hook-failed")
+          logFile("toolcall-guard.errors", { lane: "v2-http-response", reason: "hook-failed" })
+        }
+      }
+    }))
     LIVE.wrapped = Math.max(LIVE.wrapped, 1)
   } catch (e) {
     logFile("toolcall-guard.errors", { lane: "v2-register", hook: "http.response", err: String((e && e.message) || e).slice(0, 300) })
@@ -1282,8 +1332,8 @@ const toolCallGuardV2Setup = async (ctx) => {
   // 2) outbound-history scrub on every model-request kind (V1's single
   // messages.transform covered all of them via the shared fetch path).
   // CORE layer, unconditional: on V1 the ChatML scrub runs regardless of
-  // lane flags — TOOLCALL_GUARD_SCRUB gates only the confab lane (not
-  // ported), never this one.
+  // lane flags — TOOLCALL_GUARD_SCRUB gates only the confab lane
+  // (plugin-v2/confab.js), never this one.
   const scrubPass = (event) => {
     try {
       const stats = { n: 0 }
@@ -1293,7 +1343,7 @@ const toolCallGuardV2Setup = async (ctx) => {
   }
   for (const kind of ["context", "compaction", "generate", "title"]) {
     try {
-      await ctx.session.hook(kind, scrubPass)
+      keep(await ctx.session.hook(kind, scrubPass))
     } catch (e) {
       logFile("toolcall-guard.errors", { lane: "v2-register", hook: kind, err: String((e && e.message) || e).slice(0, 300) })
     }
@@ -1304,9 +1354,9 @@ const toolCallGuardV2Setup = async (ctx) => {
   // (V1: the event handler early-returns when every lane is off).
   // clipKind heuristic; once per assistant message, max 3 per session,
   // subagent sessions and aborted turns skipped.
-  if (MASTER_OFF) return
+  if (MASTER_OFF) return cleanup
   const sessions = new Map()
-  const controller = new AbortController()
+  controller = new AbortController()
   const evProbe = (process.env.TOOLCALL_GUARD_V2_DEBUG || "").toLowerCase() === "events"
   let evSeen = 0
   void (async () => {
@@ -1316,7 +1366,7 @@ const toolCallGuardV2Setup = async (ctx) => {
           try {
             appendFileSync(
               join(DATA_DIR(), "toolcall-guard.events"),
-              JSON.stringify({ at: nowStamp(), keys: Object.keys(ev || {}), type: ev && ev.type, event: ev && ev.event, dataKeys: Object.keys((ev && ev.data) || {}) }) + "\n",
+              JSON.stringify({ at: nowStamp(), type: ["session.execution.succeeded", "session.idle"].includes(ev?.type) ? ev.type : "other" }) + "\n",
             )
           } catch {}
         }
@@ -1363,7 +1413,7 @@ const toolCallGuardV2Setup = async (ctx) => {
     }
   })()
 
-  return () => controller.abort()
+  return cleanup
 }
 
 // Default export stays the V1 FUNCTION: v1.19.3 does NOT load object entries

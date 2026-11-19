@@ -128,4 +128,4 @@ http
       res.end()
     })
   })
-  .listen(PORT, "127.0.0.1", () => console.log(`guard server on ${PORT} scenario=${SCENARIO}`))
+  .listen(PORT, "127.0.0.1", function () { console.log(`guard server on ${this.address().port} scenario=${SCENARIO}`) })
