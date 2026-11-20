@@ -18,6 +18,8 @@ const CORE = ["http.response", "context", "compaction", "generate", "title"]
 // stream-report is on by default and disappears under TOOLCALL_GUARD=off (it
 // is a lane); the core's http.response registration is the one that survives.
 const OBSERVER = ["http.response"]
+// subreport is the one default-on legacy lane (notify): adds a context hook
+const SUBREPORT = ["context"]
 const FLAGS = {
   TOOLCALL_GUARD_PREFLIGHT: "log",
   TOOLCALL_GUARD_CLAMP: "1",
@@ -91,11 +93,11 @@ function scenario(extra, fakeTool = true) {
 const session = (names) => names.map((h) => `session:${h}`)
 const sorted = (a) => [...a].sort()
 
-test("no flags: core + observer hooks and the auto-continue subscription", () => {
+test("no flags: core + observer + subreport hooks and the auto-continue subscription", () => {
   const out = scenario({})
   assert.equal(out.id, "toolcall-guard")
   assert.equal(out.threw, undefined)
-  assert.deepEqual(out.hooks, sorted(session([...CORE, ...OBSERVER])))
+  assert.deepEqual(out.hooks, sorted(session([...CORE, ...OBSERVER, ...SUBREPORT])))
   assert.equal(out.subscriptions, 1)
   assert.equal(out.activeSubs, 1)
   assert.deepEqual(out.afterHooks, [])
@@ -136,7 +138,7 @@ test("all flags on: every lane registers and teardown releases everything", () =
 test("failing optional lane (no ctx.tool, PREFLIGHT=log) is non-fatal", () => {
   const out = scenario({ TOOLCALL_GUARD_PREFLIGHT: "log" }, false)
   assert.equal(out.threw, undefined)
-  assert.deepEqual(out.hooks, sorted(session([...CORE, ...OBSERVER])))
+  assert.deepEqual(out.hooks, sorted(session([...CORE, ...OBSERVER, ...SUBREPORT])))
   assert.equal(out.subscriptions, 1)
   const lines = out.errors.trim().split("\n").map((l) => JSON.parse(l))
   assert.equal(lines.length, 1)

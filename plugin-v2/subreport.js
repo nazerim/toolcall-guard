@@ -10,14 +10,25 @@ const suffix = "\n</subagent>"
 const suspect = /(?:">\n\s*|Subagent completed without a text response\.\s*|`\s*)\n<\/subagent>$/
 
 export async function setupSubreport(ctx, { clipKind, DATA_DIR }) {
-  // "1" means "log" (observe only), consistent with SCRUB=1 and AUDIT=1
-  // never rewriting by default; annotating outbound context needs "annotate".
-  const raw = process.env.TOOLCALL_GUARD_SUBREPORT?.toLowerCase()
-  const mode = raw === "1" ? "log" : raw
-  if (process.env.TOOLCALL_GUARD?.toLowerCase() === "off" || !["log", "annotate"].includes(mode)) return
+  // Default notify (in-band annotation; the parent nudge itself lives in the
+  // core event loop, same mode value). "1" means "log" (observe only),
+  // consistent with SCRUB=1 and AUDIT=1 never rewriting by default. The mode
+  // is RE-READ per call (matching the core loop's event-time read), so an env
+  // change or downgrade takes effect without waiting for a re-setup; setup
+  // merely decides whether to register at all.
+  const srMode = () => {
+    const raw = (process.env.TOOLCALL_GUARD_SUBREPORT || "notify").toLowerCase()
+    return raw === "1" ? "log" : raw
+  }
+  if (
+    process.env.TOOLCALL_GUARD?.toLowerCase() === "off" ||
+    !["log", "annotate", "notify"].includes(srMode())
+  ) return
   const seen = new Set()
   const registration = await ctx.session.hook("context", async (event) => {
     try {
+      const mode = srMode()
+      if (!["log", "annotate", "notify"].includes(mode)) return
       let stored
       for (const m of event.messages) {
         for (const p of m.content) {
@@ -59,7 +70,7 @@ export async function setupSubreport(ctx, { clipKind, DATA_DIR }) {
                 JSON.stringify({ at: new Date().toISOString(), mode, kind }) + "\n", { mode: 0o600 })
             } catch { /* Marker failure must not prevent annotation. */ }
           }
-          if (mode !== "annotate") continue
+          if (mode === "log") continue
           const note = `\n[toolcall-guard subreport: ${kind === "empty-report" ? "no text report" : "possibly clipped report"}; verify the work or resume with subagent sessionID="${id}".]`
           if (m.role === "tool") p.result = { ...p.result, value: text + note }
           else p.text = text + note

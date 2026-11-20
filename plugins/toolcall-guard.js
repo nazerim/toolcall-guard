@@ -24,6 +24,7 @@
 //   - well-formed streams pass through byte-identical.
 
 import { appendFileSync, writeFileSync, readdirSync, renameSync, statSync, unlinkSync } from "node:fs"
+import { createHash } from "node:crypto"
 import { randomUUID } from "node:crypto"
 import { homedir } from "node:os"
 import { join } from "node:path"
@@ -944,6 +945,11 @@ async function maybeAudit(sessionID, msgs, sessions, isSub, client) {
 // sees. Default: LOG only. TOOLCALL_GUARD_SUBREPORT=annotate additionally
 // appends a fact + resume-with-task-id affordance to the outbound copy
 // (DB untouched, idempotent, never re-logs the same part).
+// V2 (2026-11-21) closes the remaining hole — the parent ENDING the turn
+// after a bad report, when no next model call ever shows the annotation:
+// default mode notify = in-band annotation + ONE parent nudge at turn end
+// (analyzeSubreportV2 + SR_NUDGE, per-envelope claim file, ≤2 per session).
+// V1 semantics above are unchanged.
 const SUBREPORT_MODE = (process.env.TOOLCALL_GUARD_SUBREPORT || "").toLowerCase()
 const TASK_BODY_RX = /<task\s+id="(ses_[^"]+)"[^>]*>\s*<task_result>([\s\S]*?)<\/task_result>/
 const subreportSeen = new Set()
@@ -1217,6 +1223,102 @@ const analyzeMessagesV2 = (raw) => {
   return { messageID: last.id, kind, tail: text.trim().slice(-40) }
 }
 
+// V2 subreport mode: the recovery actor for a bad child report is the PARENT
+// (nudging the child cannot work — its turn is over and the parent already
+// holds the empty/clipped result). Default notify = in-band annotation
+// (plugin-v2/subreport.js) + one parent nudge at turn end when the last
+// completed child report is bad and the parent finished after it. TOOLCALL_GUARD_SUBREPORT=
+// off|0 disables lane+nudge; log|1 observes only; annotate = in-band without
+// the nudge. Master TOOLCALL_GUARD=off dominates (lane early-returns; the
+// event loop is already off-gated). Read at event time — a module-level const
+// would let the core nudge and the lane annotation disagree after an env
+// change that only re-runs setup.
+const subreportV2Mode = () => {
+  const raw = (process.env.TOOLCALL_GUARD_SUBREPORT || "notify").toLowerCase()
+  return raw === "1" ? "log" : raw
+}
+// Envelope ids are model/provider-shaped (may contain "/", can be long) —
+// never interpolate them into a filename unhashed. Session ids keep the same
+// trust level the clip path already gives message ids.
+const srClaimKey = (sessionID, envelopeKey) =>
+  "subreport." + sessionID + "." + createHash("sha256").update(String(envelopeKey)).digest("hex").slice(0, 24)
+// Per-session nudge budget SHARED across plugin instances and reloads.
+// Two atomically reserved slot files (exclusive create — no check-then-count
+// race across processes). A slot is consumed only after the per-envelope
+// claim also won, so nudges are at most one per envelope AND ≤2 per session
+// (plus a fail-open allowance on fs errors, same policy as claimNudge).
+// Slot files live as long as the session: the budget is a lifetime cap.
+const SR_BUDGET = 2
+const tryReserveSrSlot = (sessionID) => {
+  for (let k = 0; k < SR_BUDGET; k++) {
+    try {
+      appendFileSync(join(DATA_DIR(), "toolcall-guard.nudge.subreport." + sessionID + ".slot." + k), "", { flag: "wx" })
+      return true
+    } catch (e) {
+      if (!(e && e.code === "EEXIST")) return true // fail open, like claimNudge
+    }
+  }
+  return false
+}
+
+// Last completed subagent envelope in stored V2 context; null unless it is
+// bad (empty/possibly-clipped) AND the parent's last assistant message landed
+// after it (i.e. the parent already consumed the bad report and finished —
+// a stale bad envelope from an earlier turn never re-fires, and the
+// per-envelope claim file backstops dedupe across instances/reloads).
+const analyzeSubreportV2 = (raw) => {
+  const msgs = Array.isArray(raw) ? raw : (raw && Array.isArray(raw.data) ? raw.data : [])
+  const SUFFIX = "\n</subagent>"
+  const envelope = (text) => {
+    const hit = /^<subagent sessionID="(ses_[A-Za-z0-9_-]+)"[^>]*>\n/.exec(text || "")
+    if (!hit || !text.endsWith(SUFFIX)) return null
+    const body = text.slice(hit[0].length, -SUFFIX.length).trim()
+    const kind = !body || body === "Subagent completed without a text response."
+      ? "empty-report"
+      : clipKind(body) ? "clipped-report" : null
+    return { childID: hit[1], kind }
+  }
+  let env = null
+  let lastAssistant = -1
+  for (let i = 0; i < msgs.length; i++) {
+    const m = msgs[i]
+    if (!m) continue
+    if (m.type === "assistant") {
+      lastAssistant = i
+      // Foreground deliveries: subagent tool results inside the assistant's
+      // own content. The last one wins; a later healthy retry cancels an
+      // earlier bad report. The turn itself is the position (index i) and is
+      // trivially "parent finished after".
+      for (const c of Array.isArray(m.content) ? m.content : []) {
+        if (!c || c.type !== "tool" || c.name !== "subagent") continue
+        const out = c.output ?? c.result
+        const value = out && out.type === "content" && Array.isArray(out.value)
+          ? out.value.filter((v) => v && v.type === "text").map((v) => v.text || "").join("")
+          : typeof out === "string" ? out : out && out.type === "text" ? out.value : null
+        const e = value === null ? null : envelope(value)
+        if (e) env = { index: i, msgID: c.id, ...e }
+      }
+      continue
+    }
+    if (m.type !== "synthetic") continue // background outcome delivered later
+    const md = m.metadata
+    if (!md || md.source !== "subagent" || md.state !== "completed") continue
+    const e = envelope(m.text)
+    // Authentication mirrors the lane: metadata is the trusted source; a
+    // missing or mismatching childID means this is not a report we act on.
+    if (e && md.childID === e.childID) env = { index: i, msgID: m.id, ...e }
+  }
+  if (!env || !env.kind) return null
+  if (lastAssistant < env.index) return null // parent has not answered after it yet
+  return { childID: env.childID, kind: env.kind, key: String(env.msgID ?? env.index) }
+}
+
+const SR_NUDGE = (childID, kind) =>
+  '[toolcall-guard subagent report] The last subagent delegation (sessionID="' + childID + '") returned ' +
+  (kind === "empty-report" ? "no text report" : "a report likely truncated by the provider's parser") +
+  '. Do not treat that delegation as complete. Resume it with subagent sessionID="' + childID +
+  '" asking for its final report, or re-run the task with narrower scope. If you already verified the work another way, state the residual gap to the user instead.'
+
 const toolCallGuardV2Setup = async (ctx) => {
   // Hook registrations are released by the returned cleanup (with the
   // event-subscription abort), so teardown leaves no core hook behind.
@@ -1388,22 +1490,41 @@ const toolCallGuardV2Setup = async (ctx) => {
           if (info && info.parentID) continue
           const msgs = await ctx.session.context({ sessionID })
           const a = analyzeMessagesV2(msgs)
-          if (!a) continue
           let st = sessions.get(sessionID)
           if (!st) {
             // long-lived serve: clip-state is per-session; cap growth by
             // clearing wholesale on overflow (losing nudge budgets for very
-            // old sessions is the acceptable failure mode)
+            // old sessions is the acceptable failure mode — the SUBREPORT
+            // budget does NOT live here, it is claim-file backed)
             if (sessions.size > 500) sessions.clear()
-            st = { nudged: new Set(), count: 0 }
+            st = { nudged: new Set(), count: 0, srNudged: new Set() }
             sessions.set(sessionID, st)
           }
-          if (st.nudged.has(a.messageID) || st.count >= 3) continue
-          if (!claimNudge(a.messageID)) continue
-          st.nudged.add(a.messageID)
-          st.count++
-          await ctx.session.prompt({ sessionID, text: NUDGE(a.tail) })
-          logFile("toolcall-guard.clips", { sessionID, messageID: a.messageID, kind: a.kind })
+          if (a && !st.nudged.has(a.messageID) && st.count < 3 && claimNudge(a.messageID)) {
+            st.nudged.add(a.messageID)
+            st.count++
+            await ctx.session.prompt({ sessionID, text: NUDGE(a.tail) })
+            logFile("toolcall-guard.clips", { sessionID, messageID: a.messageID, kind: a.kind })
+          }
+          // Subreport parent-nudge (notify mode): bad last child report and
+          // the parent answered anyway. Suppressed whenever THIS turn has a
+          // clip candidate (a is deterministic from context, so the rule
+          // holds under duplicate delivery and across instances) — one
+          // recovery prompt per event, clip first. Dedupe per envelope is
+          // the sessionID-namespaced hash claim; the ≤2/session budget is
+          // two atomically reserved slot files (shared across instances
+          // and reloads; fs errors fail open, same policy as claimNudge).
+          // st.srNudged is only a per-instance fast path (no syscalls on
+          // repeated deliveries of a settled envelope).
+          if (!a && subreportV2Mode() === "notify") {
+            const sr = analyzeSubreportV2(msgs)
+            const srKey = sr && srClaimKey(sessionID, sr.key)
+            if (srKey && !st.srNudged.has(srKey) && claimNudge(srKey) && tryReserveSrSlot(sessionID)) {
+              st.srNudged.add(srKey)
+              await ctx.session.prompt({ sessionID, text: SR_NUDGE(sr.childID, sr.kind) })
+              logFile("toolcall-guard.clips", { sessionID, messageID: sr.key, kind: "subreport-" + sr.kind })
+            }
+          }
         } catch (e) {
           logFile("toolcall-guard.errors", { lane: "v2-events", err: String((e && e.message) || e).slice(0, 300) })
         }
@@ -1427,6 +1548,7 @@ ToolCallGuardPlugin.__test = {
   DATA_DIR,
   guardSseResponse,
   analyzeMessagesV2,
+  analyzeSubreportV2,
   claimNudge,
   toolCallGuardV2Setup,
 }

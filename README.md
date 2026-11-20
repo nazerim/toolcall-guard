@@ -114,8 +114,11 @@ V2 layers ported (env flags shared with V1):
 | `experimental.chat.messages.transform` | `ctx.session.hook("context"/"compaction"/"generate"/"title")` + `scrubStrings` (shape-agnostic deep walk covers V2 text/reasoning/tool-arg parts) |
 | `event` on `session.idle` | `ctx.event.subscribe()` on **`session.execution.succeeded`** — V2's turn-complete event. The shared V2 service runs plugin setup once PER LOCATION and may also deliver the V1-compat `session.idle` per turn, so one event can reach several instances: nudges are guarded by an exclusive-create claim file per message (`toolcall-guard.nudge.<messageID>`), making double delivery a functional no-op (only the `idles` log doubles). Message shape via `ctx.session.context()` (`{data:[…]}` envelope; `finish` presence replaces the step-finish-part abort check) |
 
-The six legacy lanes are ported as **opt-in** V2 lanes (off unless set;
-V1's `0`/`off` also mean off). Details: [lane status](docs/v2-legacy-lanes.md),
+Five legacy lanes are ported as **opt-in** V2 lanes (off unless set;
+V1's `0`/`off` also mean off). **Subreport is the exception: default-on as
+`notify` since 2026-11-21** — a dead child report nobody reacts to was the
+gap; set `TOOLCALL_GUARD_SUBREPORT=log` (or `off`) to downgrade.
+Details: [lane status](docs/v2-legacy-lanes.md),
 [live vs fixture-only verification](docs/v2-port-queue.md).
 
 | V2 flag (`TOOLCALL_GUARD_…`) | Values | Effect |
@@ -124,7 +127,7 @@ V1's `0`/`off` also mean off). Details: [lane status](docs/v2-legacy-lanes.md),
 | `PREFLIGHT` | `1`\|`log`\|`block` | log rule hits on `shell`; `block` refuses |
 | `CLAMP` (+`CLAMP_MS`) | `1` (ms, default 120000) | timeout on scan-like commands lacking one |
 | `BINARY` | `1` | NUL-bearing tool text → notice (model input only, not UI) |
-| `SUBREPORT` | `log`\|`annotate` | empty/clipped child reports; `annotate` adds resume hint to outbound copy |
+| `SUBREPORT` | `off`\|`0`\|`1`\|`log`\|`annotate`\|`notify` (**default: `notify`**) | empty/clipped child reports; annotate/notify add the resume hint in-band; notify ALSO nudges the parent once at turn end when it finished on a bad report (suppressed when that turn has a clip candidate; per-envelope claim file; lifetime cap ≤2/session via two atomically reserved slot files; fs errors fail open) |
 | `SCRUB` (+`SCRUB_JEV`) | `1`\|`log`\|`strip` (`1`) | confab rules; `strip` drops matched reasoning; `SCRUB_JEV=1` enables classifier tier |
 | `AUDIT` (+`AUDIT_SEND`, `DANGLING`) | `1`\|`log`\|`overnight` (`1`, `nudge`) | turn audit; `AUDIT_SEND=1` sends text to classifier; `DANGLING=nudge` (not with `log`) queues one nudge |
 | `JANITOR` | `1`\|`dry` | early delete (or count) of >1 GB, >24 h tool-output spills |
@@ -251,7 +254,7 @@ Provider-scoped to `qwen|ds4` by default (`TOOLCALL_GUARD_SCRUB_PROVIDERS`).
 | `TOOLCALL_GUARD_JANITOR` | `0` disables the startup sweep of >1 GB, >24 h tool-output spills | on |
 | `TOOLCALL_GUARD_DANGLING` | `nudge` activates auto-continue on deterministic dangling-announcement stops (colon/em-dash ending + zero tool calls, main sessions, max 2/session); unset = log-only | log |
 | `TOOLCALL_GUARD_LIVENESS_LOG` | redirect the guard-liveness warning (default: `toolcall-guard.errors`) | unset |
-| `TOOLCALL_GUARD_SUBREPORT` | `off` \| log-only (unset) \| `annotate` (append fact + resume-with-task-id hint to empty/clipped subagent reports in the outbound copy) | log |
+| `TOOLCALL_GUARD_SUBREPORT` | `off` \| log-only (V1 unset; **V2 defaults to `notify`**) \| `annotate` (append fact + resume-with-task-id hint to empty/clipped subagent reports in the outbound copy) \| `notify` (V2: annotate + one parent nudge at turn end) | log (V1) / notify (V2) |
 | `TOOLCALL_GUARD_SCRUB_PROVIDERS` | regex | `qwen\|ds4` |
 | `TOOLCALL_GUARD_CONFAB_LOG` | log path override | real log (tests point here) |
 | `TOOLCALL_GUARD_DATA_DIR` | absolute dir override for all markers/logs (wins over `XDG_DATA_HOME`) — pin it when a process might inherit the other install's env | unset |
