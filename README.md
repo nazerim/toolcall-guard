@@ -128,6 +128,7 @@ V1's `0`/`off` also mean off). Details: [lane status](docs/v2-legacy-lanes.md),
 | `SCRUB` (+`SCRUB_JEV`) | `1`\|`log`\|`strip` (`1`) | confab rules; `strip` drops matched reasoning; `SCRUB_JEV=1` enables classifier tier |
 | `AUDIT` (+`AUDIT_SEND`, `DANGLING`) | `1`\|`log`\|`overnight` (`1`, `nudge`) | turn audit; `AUDIT_SEND=1` sends text to classifier; `DANGLING=nudge` (not with `log`) queues one nudge |
 | `JANITOR` | `1`\|`dry` | early delete (or count) of >1 GB, >24 h tool-output spills |
+| (stream report — no flag, on unless master `off`) | — | proof of life for the V2 guard: `sse-seen` / `response-replaced` / `non-sse-primary` in `toolcall-guard.stream-info`, ≤12 lines per module instance — sessionID, status, and (for non-SSE) the provider content-type truncated to 64 chars; no payload text ([coverage note](docs/v2-subagent-coverage.md)) |
 
 > **Warning:** V1-era exports in a shell profile (e.g. `TOOLCALL_GUARD_AUDIT=1`,
 > `TOOLCALL_GUARD_SCRUB=strip`, `TOOLCALL_GUARD_JANITOR=1`,
@@ -290,6 +291,12 @@ for t in test/*.test.mjs; do node $t; done   # unit suites, incl. test/v2.test.m
                                               # (entry shapes, analyzeMessagesV2,
                                               #  guardSseResponse, deep scrub)
 ```
+
+`test/v2-subagent-stream.test.mjs` additionally pins the 2.3.2 dispatch shape:
+root **and** child SSE streams produce `sse-seen`/`response-replaced` lines,
+`TOOLCALL_GUARD=off` silences the reporter (the core keeps guarding), the
+12-line budget is module-scoped across setups without affecting repair, and
+fatality follows the `{ fatal: true }` descriptor, not lane position.
 
 End-to-end against a synthetic malformed SSE server (no real API needed):
 

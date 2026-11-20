@@ -2,9 +2,14 @@ import { appendFileSync } from "node:fs"
 import { join } from "node:path"
 
 // Compose core + optional V2 setup functions. Each lane owns its flag checks
-// and may return a disposer. The first lane is core: its failure fails the
-// plugin and unwinds everything. An optional lane failure is logged
-// (metadata only) and skipped; that lane's partial registrations are released.
+// and may return a disposer. A lane is either a function (legacy: the FIRST
+// function is core — its failure fails the plugin and unwinds everything,
+// later failures are logged and skipped) or a { setup, fatal } descriptor.
+// If ANY lane declares fatal explicitly, the positional rule is disabled:
+// only declared-fatal lanes fail the plugin; every other lane's failure is
+// logged (metadata only) and skipped, with its partial registrations released.
+// Registration ORDER stays as given — an observer lane that must see the
+// untouched response can be optional and still run first.
 const bind = (target, key) => {
   const value = target[key]
   return typeof value === "function" ? value.bind(target) : value
@@ -87,6 +92,8 @@ function logLaneFailure(helpers, index, setup, err) {
 }
 
 export async function setupLanes(ctx, helpers, lanes) {
+  const specs = lanes.map((lane) => (typeof lane === "function" ? { setup: lane } : lane))
+  const explicitFatal = specs.some((s) => s.fatal === true)
   const disposers = []
   const dispose = async () => {
     const failures = []
@@ -99,14 +106,16 @@ export async function setupLanes(ctx, helpers, lanes) {
     }
     if (failures.length) throw new AggregateError(failures, "guard teardown failed")
   }
-  for (const [index, setup] of lanes.entries()) {
+  for (const [index, spec] of specs.entries()) {
+    const setup = spec.setup
+    const fatal = spec.fatal === true || (!explicitFatal && index === 0)
     const lane = trackLane(ctx)
     try {
       const cleanup = await setup(lane.view, helpers)
       if (typeof cleanup === "function") disposers.push(cleanup)
     } catch (err) {
       const failures = await lane.release()
-      if (index > 0) {
+      if (!fatal) {
         logLaneFailure(helpers, index, setup, err)
         continue
       }

@@ -15,6 +15,9 @@ const root = mkdtempSync(join(tmpdir(), "guard-entry-"))
 after(() => rmSync(root, { recursive: true, force: true }))
 
 const CORE = ["http.response", "context", "compaction", "generate", "title"]
+// stream-report is on by default and disappears under TOOLCALL_GUARD=off (it
+// is a lane); the core's http.response registration is the one that survives.
+const OBSERVER = ["http.response"]
 const FLAGS = {
   TOOLCALL_GUARD_PREFLIGHT: "log",
   TOOLCALL_GUARD_CLAMP: "1",
@@ -88,11 +91,11 @@ function scenario(extra, fakeTool = true) {
 const session = (names) => names.map((h) => `session:${h}`)
 const sorted = (a) => [...a].sort()
 
-test("no flags: only core hooks and the auto-continue subscription", () => {
+test("no flags: core + observer hooks and the auto-continue subscription", () => {
   const out = scenario({})
   assert.equal(out.id, "toolcall-guard")
   assert.equal(out.threw, undefined)
-  assert.deepEqual(out.hooks, sorted(session(CORE)))
+  assert.deepEqual(out.hooks, sorted(session([...CORE, ...OBSERVER])))
   assert.equal(out.subscriptions, 1)
   assert.equal(out.activeSubs, 1)
   assert.deepEqual(out.afterHooks, [])
@@ -117,6 +120,7 @@ test("all flags on: every lane registers and teardown releases everything", () =
   assert.equal(out.threw, undefined)
   assert.deepEqual(out.hooks, sorted([
     ...session(CORE),
+    ...session(OBSERVER), // stream-report
     "session:context", // subreport
     "session:context", // confab
     "tool:execute.before", // preflight + clamp
@@ -132,12 +136,12 @@ test("all flags on: every lane registers and teardown releases everything", () =
 test("failing optional lane (no ctx.tool, PREFLIGHT=log) is non-fatal", () => {
   const out = scenario({ TOOLCALL_GUARD_PREFLIGHT: "log" }, false)
   assert.equal(out.threw, undefined)
-  assert.deepEqual(out.hooks, sorted(session(CORE)))
+  assert.deepEqual(out.hooks, sorted(session([...CORE, ...OBSERVER])))
   assert.equal(out.subscriptions, 1)
   const lines = out.errors.trim().split("\n").map((l) => JSON.parse(l))
   assert.equal(lines.length, 1)
   assert.equal(lines[0].lane, "v2-setup")
-  assert.equal(lines[0].index, 1)
+  assert.equal(lines[0].index, 2)
   assert.equal(lines[0].name, "setupPreflight")
   assert.equal(lines[0].code, "TypeError")
   assert.deepEqual(Object.keys(lines[0]).sort(), ["at", "code", "index", "lane", "name"])
