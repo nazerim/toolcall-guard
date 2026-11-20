@@ -1,34 +1,59 @@
 # toolcall-guard
 
-An [opencode](https://opencode.ai) plugin (1.x) that stops OpenAI-compatible
-providers from killing your session with:
+An [opencode](https://opencode.ai) plugin (1.x **and** 2.x) that stops
+OpenAI-compatible providers from killing your session with:
 
 ```
 Expected 'function.name' to be a string.
 ```
 
 (`AI_InvalidResponseDataError`, thrown from the bundled
-`@ai-sdk/openai-compatible` stream handler.)
+`@ai-sdk/openai-compatible` stream handler. On opencode 2.x the same
+provider-side malformation instead surfaces as
+`OpenAI Chat tool call delta is missing id or name` from its native handler,
+or silently as clipped turns — see [Who needs this](#who-needs-this).)
 
 ## Who needs this
 
-Any opencode 1.x user on a provider whose server parses ChatML-native models
-(Qwen, DeepSeek, GLM, …) into OpenAI-style `tool_calls` deltas:
+Any opencode user (1.x **or** 2.x) on a provider whose server parses
+ChatML-native models (Qwen, DeepSeek, GLM, …) into OpenAI-style `tool_calls`
+deltas:
 
 - DashScope / Aliyun **token-plan** subscription endpoints (frequent)
 - **vLLM** with `qwen3_xml` tool parser
 - **llama.cpp** with certain parser flags
 - NVIDIA NIM and other "OpenAI-compatible" gateways
 
-Reported upstream as [anomalyco/opencode#26412](https://github.com/anomalyco/opencode/issues/26412),
+Upstream history (re-verified 2026-11-20): the 1.x crash came from a stale
+bundled `@ai-sdk/openai-compatible` in the compiled binary. Filed upstream as
+[anomalyco/opencode#26412](https://github.com/anomalyco/opencode/issues/26412),
 [#24137](https://github.com/anomalyco/opencode/issues/24137),
-[#31295](https://github.com/anomalyco/opencode/issues/31295) — all closed
-(duplicates / "file against vercel/ai"). Vercel fixed the SDK
-([vercel/ai#18440](https://github.com/vercel/ai/issues/18440) → PR #18445; the
-throw string is gone in `@ai-sdk/openai-compatible@3.0.62`), but opencode 1.x
-ships a **stale bundled copy** inside its compiled binary, so the crash is
-still live. Everyone's tracker says "not ours". This plugin fixes it client-side
-today.
+[#31295](https://github.com/anomalyco/opencode/issues/31295) (all closed —
+"file against vercel/ai") and [#52462](https://github.com/anomalyco/opencode/issues/52462)
+(closed `not_planned` by the v1-triage sweep; the v1 line still bundles the
+pre-fix copy — 1.19.6 pins 2.0.37/2.0.41). The SDK was fixed by
+[vercel/ai#18440](https://github.com/vercel/ai/issues/18440) → PR
+[#18445](https://github.com/vercel/ai/pull/18445), which reworked the shared
+`streaming-tool-call-tracker.ts` in `@ai-sdk/provider-utils` (deltas are
+correlated to the open call by id+index+name and buffered until identity
+resolves) — no-throw from `@ai-sdk/openai-compatible` **2.0.58** / **3.0.58**
+(earlier drafts of this README said 3.0.62; the throw string survives for
+truly unresolvable names). opencode 2.x meanwhile rewrote its own OpenAI-Chat
+layer ([#37847](https://github.com/anomalyco/opencode/pull/37847) buffers
+partial tool-call identity; [#48943](https://github.com/anomalyco/opencode/pull/48943)
+aliased `@ai-sdk/openai-compatible` to the native impl), so the old message is
+gone from 2.x binaries.
+
+**The bug family is still live on opencode 2.x in our usage (2.3.2).** The
+servers keep emitting the malformed fragments, and 2.x's native handler has
+its own residual failure for unresolvable identity —
+`OpenAI Chat tool call delta is missing id or name`
+([#52700](https://github.com/anomalyco/opencode/issues/52700) /
+[#53690](https://github.com/anomalyco/opencode/issues/53690), both closed
+`not_planned`) — plus the silent mode-2/3 truncations no parser-side fix can
+see (the clip lanes below still fire on our 2.x sessions). The stream guard
+normalizes fragments before the parser runs, so it covers the 1.x SDK throw
+*and* the 2.x native error. This plugin fixes it client-side today.
 
 ## What it does (three layers)
 
